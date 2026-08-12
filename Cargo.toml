@@ -1,0 +1,32 @@
+[package]
+name = "vyges-ifp"
+version = "0.1.30"
+edition = "2021"
+description = "Floorplan initialization over the OpenDB database: die/core area, site-grid snapping, and rows."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+repository = "https://github.com/vyges-tools/ifp"
+
+[dependencies]
+# The database is the substrate and the output: ifp reads the tech/site grid and writes the die
+# area, the rows, and the core area those rows cover.
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main" }
+vyges-events = { git = "https://github.com/vyges-tools/events.git", branch = "main", default-features = false }
+serde_json = "1"
+
+# Local development against the sibling checkouts. Patches are only honored from the root
+# manifest, so this is a no-op for downstream consumers pulling us by git.
+[patch."https://github.com/vyges-tools/opendb.git"]
+vyges-opendb = { path = "../vyges-tools-opendb" }
+
+[patch."https://github.com/vyges-tools/opendb-lib.git"]
+vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[[bin]]
+name = "vyges-ifp"
+path = "src/main.rs"
+
+[lib]
+name = "vyges_ifp"
+path = "src/lib.rs"
