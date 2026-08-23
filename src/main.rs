@@ -40,8 +40,30 @@ EXIT STATUS:
   2  error       usage error, unreadable database, no DBU scale, or a failed write
 ";
 
+
+/// The pin, inherited from the crate every engine already depends on.
+const CRATE_PIN: &str = vyges_opendb::OPENROAD_PIN;
+
+/// The pin this binary was built against, injected into the descriptor at print time.
+///
+/// 🔑 **One definition for the whole programme, inherited rather than typed.** The SHA lives in
+/// `openroad-pin.yaml` in `vyges-opendb-lib` and reaches here through `vyges-opendb`, which this
+/// engine already depends on. Before this, every engine spelled the pin out in its own
+/// `--describe` prose, and four of them were still quoting the previous one a day after it moved.
+///
+/// ⚠️ **It reports what this BINARY was built against — not that the binary is current.** A stale
+/// build reports its stale pin quite happily. That is the point: a harness compares this against
+/// the oracle image it is about to launch and refuses on a mismatch, which is the check that was
+/// missing when two engines ran a whole gate against the previous pin's oracle.
+const PIN_TOKEN: &str = "@OPENROAD_PIN@";
+
+fn describe() -> String {
+    DESCRIBE.replace(PIN_TOKEN, CRATE_PIN)
+}
+
 const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
+  "openroad_pin": "@OPENROAD_PIN@",
   "name": "ifp",
   "summary": "floorplan initialization: die area, site-grid snapping, rows, and the core area they cover",
   "maturity": "structured",
@@ -52,7 +74,7 @@ const DESCRIBE: &str = r#"{
       "The core's lower left is snapped UP to the site grid while the upper right is left where it was; the core area finally stored is what the rows COVER, not what was asked for. Both are upstream behaviors and both are load-bearing -- a caller that reads back the core area will not always get its own argument.",
       "Rows are named globally across sites (ROW_0, ROW_1, ...) rather than restarting per site, so adding a site renumbers the rows that follow it.",
       "Existing rows are cleared before the new ones are built. Anything already placed on the old row grid is not re-legalized by this engine.",
-      "Written against the upstream ifp regression goldens at pin b5624809f29048e1f9ce9e83eb562620c652e084. The algorithm is reimplemented from the published behavior, not transliterated; where the two disagree the goldens are the arbiter.",
+      "Written against the upstream ifp regression goldens at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated; where the two disagree the goldens are the arbiter.",
       "MEASURED against that suite at the same pinned commit: 23 cases reproduce every compared IFP-* line exactly, 2 fail, and 15 are not comparable (6 utilization form, 6 polygon floorplans, 3 that never call initialize_floorplan).",
       "HYBRID SITES are supported: a site with a row pattern tiles the core from that pattern (IFP-0049) and every hybrid site additionally gets rows spanning a whole pattern each (IFP-0050), offset to where its pattern occurs in the base pattern -- matching as written (R0) or reversed with orientations mirrored (MX). Row parity is REFUSED on a hybrid floorplan (IFP-0051), because parity would have to trim whole patterns rather than rows.",
       "Sites are visited in NAME order and deduplicated by name, not in the order given on the command line -- row numbering and log order both follow from this. The site set also includes sites used by placed instances that were never named as arguments (upstream addUsedSites), excluding blocks.",
@@ -649,7 +671,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--describe") {
-        print!("{DESCRIBE}");
+        print!("{}", describe());
         return ExitCode::SUCCESS;
     }
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
@@ -776,5 +798,38 @@ mod tests {
         assert_eq!(v["core_area"]["um"][0], 100.13);
         assert_eq!(v["core_was_snapped"], true);
         assert_eq!(v["odb_written"], "out.odb");
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    use super::{describe, PIN_TOKEN};
+
+    #[test]
+    fn the_descriptor_reports_the_pin_this_binary_was_built_against() {
+        let d = describe();
+        assert!(
+            !d.contains(PIN_TOKEN),
+            "the pin placeholder survived into the output -- the substitution did not run"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&d).expect("the descriptor is still valid JSON once filled in");
+        assert_eq!(
+            v["openroad_pin"], super::CRATE_PIN,
+            "the descriptor must report the pin this binary was actually built against"
+        );
+        assert_eq!(super::CRATE_PIN.len(), 40, "a full commit SHA, not an abbreviation");
+    }
+
+    /// ⛔ The whole point of inheriting the pin is that no engine carries one of its own.
+    #[test]
+    fn no_sha_is_hardcoded_anywhere_in_the_descriptor() {
+        let raw = super::DESCRIBE;
+        for tok in raw.split(|c: char| !c.is_ascii_hexdigit()) {
+            assert!(
+                tok.len() < 40,
+                "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
+            );
+        }
     }
 }
