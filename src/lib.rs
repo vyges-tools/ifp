@@ -22,6 +22,12 @@
 //! deliberate match to observable behaviour asserted by upstream's own regression goldens.
 
 /// An axis-aligned rectangle in database units.
+/// This crate's version, as Cargo knows it — the single number the whole suite is released on.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The copyright line `--version` prints.
+pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Rect {
     pub x_min: i32,
