@@ -8,7 +8,7 @@ routing) is positioned against the row grid this engine lays down. It is also th
 that **writes** to the database rather than reading it.
 
 ```text
-vyges loom ifp run design.odb --die-area '0 0 1000 1000' --core-area '10 10 990 990' --site FreePDK45_38x28_10R_NP_162NW_34O
+vyges physical ifp run design.odb --die-area '0 0 1000 1000' --core-area '10 10 990 990' --site FreePDK45_38x28_10R_NP_162NW_34O
 ```
 
 ## What it does

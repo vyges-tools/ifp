@@ -12,13 +12,20 @@ use std::process::ExitCode;
 use vyges_ifp::{plan, Instance, OrientedSite, Plan, PlanError, Rect, RowParity, Site};
 use vyges_opendb::Db;
 
+// ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
+// registry is what actually decides it (`group: "physical"`). It read `vyges loom ifp`
+// for a release after the construction engines were split out of the loom suite, because
+// nothing ties this string to that registry -- `vyges loom ifp` is now REFUSED by the CLI,
+// so the help was telling users a command that no longer runs. If the group ever moves,
+// this string moves with it. Running the binary directly as `vyges-ifp` always works and
+// is group-independent.
 const USAGE: &str = "\
-vyges loom ifp — initialize the floorplan: die area, core area, and rows
+vyges physical ifp — initialize the floorplan: die area, core area, and rows
 
 USAGE:
-  vyges loom ifp run <design.odb> --die-area 'x1 y1 x2 y2' --core-area 'x1 y1 x2 y2' --site NAME
-  vyges loom ifp --describe
-  vyges loom ifp --help
+  vyges physical ifp run <design.odb> --die-area 'x1 y1 x2 y2' --core-area 'x1 y1 x2 y2' --site NAME
+  vyges physical ifp --describe
+  vyges physical ifp --help
 
 OPTIONS:
   --die-area 'x1 y1 x2 y2'   die rectangle, in MICRONS
