@@ -1260,3 +1260,148 @@ mod tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------- make_tracks
+
+/// One layer's track pattern on one axis, exactly as `dbTrackGrid::addGridPattern*` takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrackPattern {
+    pub origin: i32,
+    pub count: i32,
+    pub step: i32,
+}
+
+/// Upstream `InitFloorplan::makeTracks(layer, x_offset, x_pitch, y_offset, y_pitch)`, one axis.
+///
+/// 🔑 **The whole rule, transcribed** (`ifp/src/InitFloorplan.cc:1032`):
+///
+/// ```text
+/// if offset == 0        -> offset = pitch          // a zero offset means "one pitch in"
+/// if offset > die span  -> SKIP the layer entirely (IFP-21 / IFP-22)
+/// count  = (die_span - offset) / pitch + 1         // INTEGER division
+/// origin = die_min + offset
+/// if origin - min_width/2 < die_min  -> origin += pitch; count--   // first track unroutable
+/// last   = origin + (count - 1) * pitch
+/// if last + min_width/2 > die_max    -> count--                    // last track unroutable
+/// ```
+///
+/// ⚠️ **`min_width / 2` is INTEGER division**, and both guards use it. An odd `min_width` therefore
+/// rounds toward zero — writing this as a float halves a DBU and moves the first track on any layer
+/// whose min width is odd.
+///
+/// ⚠️ **The two guards are SEQUENTIAL, not alternatives.** The last-track check reads the origin the
+/// first-track check may already have moved, so a pattern can lose a track at each end.
+///
+/// Returns `None` when upstream skips the layer, which is a WARNING there and must not be
+/// silently turned into an empty pattern — an empty grid compares equal to every other empty grid.
+pub fn track_pattern(
+    die_min: i32,
+    die_span: i32,
+    offset: i32,
+    pitch: i32,
+    min_width: i32,
+) -> Option<TrackPattern> {
+    let offset = if offset == 0 { pitch } else { offset };
+    if offset > die_span {
+        return None;
+    }
+    let mut count = (die_span - offset) / pitch + 1;
+    let mut origin = die_min + offset;
+    if origin - min_width / 2 < die_min {
+        origin += pitch;
+        count -= 1;
+    }
+    let last = origin + (count - 1) * pitch;
+    if last + min_width / 2 > die_min + die_span {
+        count -= 1;
+    }
+    Some(TrackPattern { origin, count, step: pitch })
+}
+
+/// Upstream `ifp::microns_to_mfg_grid` (`InitFloorplan.tcl:295`).
+///
+/// 🔑 **Double rounding, and it is not decoration**: `round(round(um * dbu / grid) * grid)`. The
+/// inner round picks the nearest whole manufacturing-grid step; the outer one lands it on a DBU.
+/// Collapsing this to `round(um * dbu)` puts an off-grid track origin into the database.
+pub fn microns_to_mfg_grid(microns: f64, dbu_per_micron: i32, manufacturing_grid: i32) -> i32 {
+    if manufacturing_grid > 0 {
+        let g = manufacturing_grid as f64;
+        ((microns * dbu_per_micron as f64 / g).round() * g).round() as i32
+    } else {
+        (microns * dbu_per_micron as f64).round() as i32
+    }
+}
+
+#[cfg(test)]
+mod make_tracks_tests {
+    use super::*;
+
+    /// The plain case: no guard fires, so the arithmetic alone decides.
+    #[test]
+    fn a_pattern_starts_one_offset_in_and_counts_whole_pitches() {
+        // die 0..1000, offset 100, pitch 100, min_width 0:
+        //   count = (1000-100)/100 + 1 = 10, origin = 100, last = 100+9*100 = 1000
+        //   first guard: 100 - 0 < 0 ? no.   last guard: 1000 + 0 > 1000 ? no.
+        let p = track_pattern(0, 1000, 100, 100, 0).unwrap();
+        assert_eq!(p, TrackPattern { origin: 100, count: 10, step: 100 });
+    }
+
+    /// ⚠️ Upstream reads a ZERO offset as "one pitch in", not as "at the die edge".
+    #[test]
+    fn a_zero_offset_becomes_one_pitch() {
+        assert_eq!(track_pattern(0, 1000, 0, 100, 0), track_pattern(0, 1000, 100, 100, 0));
+    }
+
+    /// IFP-21/22: an offset past the die is skipped, not clamped.
+    #[test]
+    fn an_offset_wider_than_the_die_skips_the_layer() {
+        assert_eq!(track_pattern(0, 500, 600, 100, 0), None, "upstream warns and returns");
+    }
+
+    /// The first-track guard moves the origin AND drops a track.
+    #[test]
+    fn an_unroutable_first_track_is_dropped_and_the_origin_moves() {
+        // offset 100, min_width 400 -> 100 - 200 = -100 < 0, so origin -> 200 and count -> 9.
+        // then last = 200 + 8*100 = 1000, and 1000 + 200 > 1000, so the last goes too: count 8.
+        let p = track_pattern(0, 1000, 100, 100, 400).unwrap();
+        assert_eq!(p, TrackPattern { origin: 200, count: 8, step: 100 });
+    }
+
+    /// ⛔ `min_width / 2` is INTEGER division. With min_width 201 the half is 100, not 100.5, so
+    /// the guard does NOT fire at origin 100 — a float would make it fire and move every track.
+    #[test]
+    fn the_half_min_width_truncates_rather_than_rounding() {
+        let p = track_pattern(0, 1000, 100, 100, 201).unwrap();
+        assert_eq!(p.origin, 100, "100 - 201/2 = 100 - 100 = 0, which is not < 0");
+        let q = track_pattern(0, 1000, 100, 100, 202).unwrap();
+        assert_eq!(q.origin, 200, "100 - 101 = -1 < 0, so this one does move");
+    }
+
+    /// The die does not have to start at zero, and every comparison is against its own bounds.
+    #[test]
+    fn the_die_origin_is_carried_into_the_track_origin() {
+        let p = track_pattern(500, 1000, 100, 100, 0).unwrap();
+        assert_eq!(p.origin, 600, "die_min + offset");
+        assert_eq!(p.count, 10);
+    }
+
+    /// Upstream's own Nangate45 numbers, so the transcription is pinned to a real technology.
+    #[test]
+    fn nangate45_metal1_matches_the_technologys_own_track_file() {
+        // Nangate45_tech.lef: DATABASE MICRONS 2000, MANUFACTURINGGRID 0.0050 -> 10 DBU.
+        // Nangate45.tracks: metal1 -x_offset 0.095 -x_pitch 0.19 -y_offset 0.07.
+        assert_eq!(microns_to_mfg_grid(0.095, 2000, 10), 190);
+        assert_eq!(microns_to_mfg_grid(0.19, 2000, 10), 380);
+        assert_eq!(microns_to_mfg_grid(0.07, 2000, 10), 140);
+    }
+
+    /// ⛔ The double rounding is load-bearing: a value between grid steps snaps to the grid first.
+    #[test]
+    fn microns_snap_to_the_manufacturing_grid_before_becoming_dbu() {
+        // 0.0101 um at 1000 DBU/um is 10.1 DBU; on a 5-DBU grid that is 2.02 steps -> 2 -> 10.
+        assert_eq!(microns_to_mfg_grid(0.0101, 1000, 5), 10);
+        // With no manufacturing grid the value is simply rounded to DBU.
+        assert_eq!(microns_to_mfg_grid(0.0101, 1000, 0), 10);
+        assert_eq!(microns_to_mfg_grid(0.0106, 1000, 0), 11, "no grid: plain rounding");
+    }
+}

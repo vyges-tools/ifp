@@ -674,6 +674,190 @@ fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `make-tracks`: upstream `make_tracks` (`ifp/src/InitFloorplan.tcl:158`).
+///
+/// Two forms, both upstream's:
+///   * no `--track` given  -> `ifp::make_layer_tracks`, i.e. every ROUTING layer with a non-zero
+///     routing level, taking each layer's own LEF pitch and offset;
+///   * `--track LAYER:xoff,xpitch,yoff,ypitch` (MICRONS) -> the one-layer form, which is what a
+///     technology's `.tracks` file calls once per layer.
+///
+/// ⚠️ **A layer whose pitch is zero is SKIPPED with a warning** (IFP-56 upstream), never given an
+/// empty grid — an empty grid compares equal to every other empty grid, so it would read as
+/// agreement.
+///
+/// ⛔ **X pattern first, then Y, on the same grid** — `makeTracks` adds both to one `dbTrackGrid`
+/// and creates it only if absent, so calling this twice for a layer ADDS patterns rather than
+/// replacing them, exactly as upstream does.
+fn make_tracks(args: &[String]) -> ExitCode {
+    let mut path: Option<&str> = None;
+    let mut out: Option<&str> = None;
+    // LAYER -> (x_offset, x_pitch, y_offset, y_pitch) in microns
+    let mut explicit: Vec<(String, [f64; 4])> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out-odb" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out = Some(v),
+                    None => {
+                        eprintln!("vyges-ifp make-tracks: --out-odb needs a FILE");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            "--track" => {
+                i += 1;
+                let Some(spec) = args.get(i) else {
+                    eprintln!("vyges-ifp make-tracks: --track needs LAYER:xoff,xpitch,yoff,ypitch");
+                    return ExitCode::from(2);
+                };
+                let Some((layer, rest)) = spec.split_once(':') else {
+                    eprintln!("vyges-ifp make-tracks: --track wants LAYER:xoff,xpitch,yoff,ypitch");
+                    return ExitCode::from(2);
+                };
+                let f: Vec<&str> = rest.split(',').collect();
+                if f.len() != 4 {
+                    eprintln!("vyges-ifp make-tracks: --track wants four values, got {rest:?}");
+                    return ExitCode::from(2);
+                }
+                let mut v = [0.0f64; 4];
+                for (k, t) in f.iter().enumerate() {
+                    match t.trim().parse::<f64>() {
+                        Ok(x) => v[k] = x,
+                        Err(_) => {
+                            eprintln!("vyges-ifp make-tracks: not a number: {t:?}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+                explicit.push((layer.to_string(), v));
+            }
+            a if a.starts_with("--") => {
+                eprintln!("vyges-ifp make-tracks: unknown option {a}");
+                return ExitCode::from(2);
+            }
+            a => path = Some(a),
+        }
+        i += 1;
+    }
+
+    let Some(path) = path else {
+        eprintln!("vyges-ifp make-tracks: needs <design.odb>");
+        return ExitCode::from(2);
+    };
+
+    let mut db = match vyges_opendb::Db::open(path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("vyges-ifp make-tracks: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let dbu = db.dbu_per_micron();
+    // ⚠️ `manufacturing_grid` is Result<Option<_>>: absent means the tech declares none, which is
+    // upstream's `hasManufacturingGrid() == false` branch — plain micron-to-DBU, no snapping.
+    let mfg = db.manufacturing_grid().ok().flatten().unwrap_or(0);
+    let die = (
+        db.block_get_die_area_x_min(),
+        db.block_get_die_area_y_min(),
+        db.block_get_die_area_x_max(),
+        db.block_get_die_area_y_max(),
+    );
+    let (dx, dy) = (die.2 - die.0, die.3 - die.1);
+
+    // Build the work list: either the layers named on the command line, or every routing layer.
+    let mut work: Vec<(String, i32, i32, i32, i32)> = Vec::new(); // layer, xoff, xpitch, yoff, ypitch
+    let mut skipped: Vec<serde_json::Value> = Vec::new();
+
+    if !explicit.is_empty() {
+        for (layer, v) in &explicit {
+            let g = |m: f64| vyges_ifp::microns_to_mfg_grid(m, dbu, mfg);
+            work.push((layer.clone(), g(v[0]), g(v[1]), g(v[2]), g(v[3])));
+        }
+    } else {
+        for (name, _dir) in db.layers_with_direction().unwrap_or_default() {
+            // Upstream's filter, both halves: ROUTING type AND a non-zero routing level.
+            if db.layer_get_type(&name).unwrap_or_default() != "ROUTING"
+                || db.layer_get_routing_level(&name) == 0
+            {
+                continue;
+            }
+            let (xp, yp) = (db.layer_get_pitch_x(&name), db.layer_get_pitch_y(&name));
+            if xp == 0 || yp == 0 {
+                // Upstream IFP-56: warn, and generate NO tracks for this layer.
+                skipped.push(serde_json::json!({ "layer": name, "why": "no pitch (IFP-56)" }));
+                continue;
+            }
+            work.push((
+                name.clone(),
+                db.layer_get_offset_x(&name),
+                xp,
+                db.layer_get_offset_y(&name),
+                yp,
+            ));
+        }
+    }
+
+    if work.is_empty() {
+        eprintln!("vyges-ifp make-tracks: no routing layer produced a track pattern.");
+        return ExitCode::from(3);
+    }
+
+    let mut made: Vec<serde_json::Value> = Vec::new();
+    for (layer, xoff, xpitch, yoff, ypitch) in &work {
+        // ⛔ **`layer_get_min_width` returns u32; every comparison it feeds is i32.** Widening
+        // the arithmetic instead would change the guards on any layer near the die edge, and no
+        // gate would see it — transcribe the reference's types, not just its logic.
+        let min_width = db.layer_get_min_width(layer) as i32;
+        let px = vyges_ifp::track_pattern(die.0, dx, *xoff, *xpitch, min_width);
+        let py = vyges_ifp::track_pattern(die.1, dy, *yoff, *ypitch, min_width);
+        // ⛔ X then Y, on one grid -- `makeTracks`'s order.
+        if let Some(p) = px {
+            if let Err(e) = db.add_track_pattern_x(layer, p.origin, p.count, p.step) {
+                eprintln!("vyges-ifp make-tracks: {layer}: {e}");
+                return ExitCode::from(1);
+            }
+        } else {
+            skipped.push(serde_json::json!({ "layer": layer, "why": "x_offset > die width (IFP-21)" }));
+        }
+        if let Some(p) = py {
+            if let Err(e) = db.add_track_pattern_y(layer, p.origin, p.count, p.step) {
+                eprintln!("vyges-ifp make-tracks: {layer}: {e}");
+                return ExitCode::from(1);
+            }
+        } else {
+            skipped.push(serde_json::json!({ "layer": layer, "why": "y_offset > die height (IFP-22)" }));
+        }
+        if px.is_some() || py.is_some() {
+            made.push(serde_json::json!({
+                "layer": layer,
+                "x": px.map(|p| serde_json::json!({"origin": p.origin, "count": p.count, "step": p.step})),
+                "y": py.map(|p| serde_json::json!({"origin": p.origin, "count": p.count, "step": p.step})),
+            }));
+        }
+    }
+
+    let dest = out.unwrap_or(path);
+    if let Err(e) = db.write(dest) {
+        eprintln!("vyges-ifp make-tracks: cannot write {dest}: {e}");
+        return ExitCode::from(2);
+    }
+    println!("{}", serde_json::json!({
+        "tool": "vyges-ifp",
+        "command": "make-tracks",
+        "status": "applied",
+        "layers": made.len(),
+        "tracks": made,
+        "skipped": skipped,
+        "odb_written": dest,
+    }));
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -699,6 +883,9 @@ fn main() -> ExitCode {
         } else {
             ExitCode::SUCCESS
         };
+    }
+    if args[0] == "make-tracks" {
+        return make_tracks(&args[1..]);
     }
     if args[0] != "run" {
         eprintln!("vyges-ifp: unknown command `{}`\n\n{USAGE}", args[0]);
