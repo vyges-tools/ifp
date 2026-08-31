@@ -795,6 +795,16 @@ fn make_tracks(args: &[String]) -> ExitCode {
             let (xp, yp) = (db.layer_get_pitch_x(&name), db.layer_get_pitch_y(&name));
             if xp == 0 || yp == 0 {
                 // Upstream IFP-56: warn, and generate NO tracks for this layer.
+                vyges_events::emit(
+                    &vyges_events::Event::new(
+                        "vyges-ifp",
+                        vyges_events::Severity::Warn,
+                        format!("IFP-0056 No pitch found layer {name} so no tracks will be \
+                                 generated."),
+                    )
+                    .with_code("IFP-TRACK-NO-PITCH")
+                    .with_objects(vec![format!("layer:{name}")]),
+                );
                 skipped.push(serde_json::json!({ "layer": name, "why": "no pitch (IFP-56)" }));
                 continue;
             }
@@ -828,6 +838,18 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         } else {
+            // ⚠️ Upstream's own wording, verbatim. The conformance harness diffs emitted lines
+            // against the `.ok` golden, so the golden's phrasing IS the contract.
+            vyges_events::emit(
+                &vyges_events::Event::new(
+                    "vyges-ifp",
+                    vyges_events::Severity::Warn,
+                    format!("IFP-0021 Track pattern for {layer} will be skipped due to \
+                             x_offset > die width."),
+                )
+                .with_code("IFP-TRACK-SKIP-X")
+                .with_objects(vec![format!("layer:{layer}")]),
+            );
             skipped.push(serde_json::json!({ "layer": layer, "why": "x_offset > die width (IFP-21)" }));
         }
         if let Some(p) = py {
@@ -836,6 +858,16 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         } else {
+            vyges_events::emit(
+                &vyges_events::Event::new(
+                    "vyges-ifp",
+                    vyges_events::Severity::Warn,
+                    format!("IFP-0022 Track pattern for {layer} will be skipped due to \
+                             y_offset > die height."),
+                )
+                .with_code("IFP-TRACK-SKIP-Y")
+                .with_objects(vec![format!("layer:{layer}")]),
+            );
             skipped.push(serde_json::json!({ "layer": layer, "why": "y_offset > die height (IFP-22)" }));
         }
         if px.is_some() || py.is_some() {
