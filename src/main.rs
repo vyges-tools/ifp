@@ -884,7 +884,10 @@ fn make_tracks(args: &[String]) -> ExitCode {
         eprintln!("vyges-ifp make-tracks: cannot write {dest}: {e}");
         return ExitCode::from(2);
     }
-    println!("{}", serde_json::json!({
+    // ⚠️ PRETTY, like `run`'s hand-built report. `json!`'s Display is compact, and a chain that
+    // prints one command's report as a block and the next one's as a single long line reads as
+    // two different tools.
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
         "tool": "vyges-ifp",
         "command": "make-tracks",
         "status": "applied",
@@ -892,7 +895,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
         "tracks": made,
         "skipped": skipped,
         "odb_written": dest,
-    }));
+    })).expect("the make-tracks report is valid JSON"));
     ExitCode::SUCCESS
 }
 
