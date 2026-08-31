@@ -24,8 +24,14 @@ vyges physical ifp — initialize the floorplan: die area, core area, and rows
 
 USAGE:
   vyges physical ifp run <design.odb> --die-area 'x1 y1 x2 y2' --core-area 'x1 y1 x2 y2' --site NAME
+  vyges physical ifp make-tracks <design.odb> [--track LAYER:xoff,xpitch,yoff,ypitch]... [--out-odb FILE]
   vyges physical ifp --describe
   vyges physical ifp --help
+
+MAKE-TRACKS:
+  Routing tracks over the die, from the technology's own pitches. With no --track, every ROUTING
+  layer with a non-zero routing level is taken from the LEF; --track gives one layer explicitly,
+  in MICRONS, which is the form a technology's .tracks file uses. Repeatable.
 
 OPTIONS:
   --die-area 'x1 y1 x2 y2'   die rectangle, in MICRONS
