@@ -1261,6 +1261,292 @@ mod tests {
     }
 }
 
+// ------------------------------------------------------------ voltage domains
+
+/// A voltage or power domain: its group name, and the bounding box of its region's boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Domain {
+    pub name: String,
+    pub bbox: Rect,
+}
+
+/// Upstream `odb::makeSiteLoc` (`odb/src/db/util.cpp`) — snap a coordinate to the site grid.
+///
+/// ```text
+/// site_x  = (x - offset) / site_width          // site_width is a DOUBLE upstream
+/// site_x1 = at_left_from_macro ? floor(site_x) : ceil(site_x)
+/// return    site_x1 * site_width + offset      // int * double -> double, TRUNCATED on return
+/// ```
+///
+/// ⚠️ **`at_left_from_macro` selects `floor`, not `ceil`** — the name reads as a side and behaves
+/// as a direction, and `updateVoltageDomain` passes `false` for a minimum and `true` for a
+/// maximum, which is how it snaps a domain box *inward*.
+///
+/// ⚠️ **The arithmetic is in `double` and truncates on the way back to `int`.** Doing it in
+/// integers instead would round the other way for a coordinate that is already on the grid but
+/// negative.
+pub fn make_site_loc(x: i32, site_width: i32, at_left_from_macro: bool, offset: i32) -> i32 {
+    let site_x = (x - offset) as f64 / site_width as f64;
+    let site_x1 = (if at_left_from_macro { site_x.floor() } else { site_x.ceil() }) as i32;
+    (site_x1 as f64 * site_width as f64 + offset as f64) as i32
+}
+
+/// Upstream `InitFloorplan::updateVoltageDomain` — rebuild the rows that cross a domain.
+///
+/// 🔑 **The whole rule** (`ifp/src/InitFloorplan.cc:539`), per domain group:
+///
+/// ```text
+/// rows            = every row whose site class is NOT PAD
+/// min_site_dx/dy  = the smallest site width/height among those rows
+/// space           = gap, or 6 * min_site_dy when no gap was given
+/// domain box      = the region's bbox, snapped INWARD to the site grid
+/// for each row:
+///     if row_y_max + space <= domain_y_min  or  row_y_min >= domain_y_max + space:  keep it
+///     else: DESTROY it and create, in this order,
+///         <row>_1        left of the domain,  if domain_x_min - space > core_lx + site_dx
+///         <row>_2        right of the domain, if snapped(domain_x_max + space) + site_dx < core_ux
+///         <row>_<domain> across the domain,   if the row lies wholly within its y range
+/// ```
+///
+/// ⚠️ **`space` is named `power_domain_y_space` upstream and is used on BOTH axes** — the left and
+/// right margins are the same value as the vertical one. Not a transcription slip; do not "fix" it.
+///
+/// ⚠️ **Only the right edge is re-snapped.** `rcr_x_min` goes through `makeSiteLoc` again;
+/// `lcr_x_max` does not.
+///
+/// 🔑 **Destroyed rows are removed and their pieces APPENDED**, so the resulting order is every
+/// surviving row in its original order followed by every piece in creation order. That is what
+/// this returns, and it is why the whole set can be rebuilt in one pass instead of destroying
+/// rows one at a time.
+///
+/// Domains are applied in sequence, each seeing the rows the previous one left, because upstream
+/// re-reads `block_->getRows()` inside its group loop.
+pub fn split_rows_for_domains(
+    rows: Vec<Row>,
+    domains: &[Domain],
+    core: Rect,
+    gap: Option<i32>,
+    site_height: &dyn Fn(&str) -> i32,
+    site_is_pad: &dyn Fn(&str) -> bool,
+) -> Vec<Row> {
+    let mut rows = rows;
+    for d in domains {
+        rows = split_rows_for_one_domain(rows, d, core, gap, site_height, site_is_pad);
+    }
+    rows
+}
+
+fn split_rows_for_one_domain(
+    rows: Vec<Row>,
+    domain: &Domain,
+    core: Rect,
+    gap: Option<i32>,
+    site_height: &dyn Fn(&str) -> i32,
+    site_is_pad: &dyn Fn(&str) -> bool,
+) -> Vec<Row> {
+    // Upstream builds its working list from the non-PAD rows and returns early when it is empty.
+    // A PAD row is never destroyed and never inspected; it simply stays where it is.
+    let considered: Vec<&Row> = rows.iter().filter(|r| !site_is_pad(&r.site)).collect();
+    if considered.is_empty() {
+        return rows;
+    }
+    let min_site_dx = considered.iter().map(|r| r.spacing).min().unwrap();
+    let min_site_dy = considered.iter().map(|r| site_height(&r.site)).min().unwrap();
+    if min_site_dx <= 0 || min_site_dy <= 0 {
+        return rows;
+    }
+    let space = gap.unwrap_or(6 * min_site_dy);
+
+    // Inward: the minimum ceils and the maximum floors.
+    let dx_min = make_site_loc(domain.bbox.x_min, min_site_dx, false, 0);
+    let dx_max = make_site_loc(domain.bbox.x_max, min_site_dx, true, 0);
+    let dy_min = make_site_loc(domain.bbox.y_min, min_site_dy, false, 0);
+    let dy_max = make_site_loc(domain.bbox.y_max, min_site_dy, true, 0);
+
+    // 🔑 **Where a piece LANDS is decided by OpenDB, not by `ifp`.** `dbRow::destroy` frees the
+    // row's table slot and the next `dbRow::create` reuses it, so a destroyed row's FIRST piece
+    // takes its place in the row list and every later piece is appended. Reproduced because the
+    // DEF is written in that order and the goldens assert it — ⛔ but it is a property of the
+    // database, not a rule of the algorithm, so do not read intent into it.
+    //
+    // Measured 2026-09-01 on `init_floorplan_dbl_row`, the case that can tell the two apart:
+    // `ROW_19_1`..`ROW_52_1` sit in the destroyed rows' own positions while their `_2` and
+    // `_TEMP_ANALOG` pieces are appended, interleaved per row in creation order. `init_floorplan8`
+    // produces no `_1` piece at all and cannot distinguish "the first piece" from "the `_2` piece".
+    let mut in_place: Vec<Row> = Vec::new();
+    let mut appended: Vec<Row> = Vec::new();
+    for row in &rows {
+        if site_is_pad(&row.site) {
+            in_place.push(row.clone());
+            continue;
+        }
+        let y_min = row.y;
+        let y_max = row.y + site_height(&row.site);
+        let site_dx = row.spacing;
+        if y_max + space <= dy_min || y_min >= dy_max + space {
+            in_place.push(row.clone());
+            continue;
+        }
+
+        // Built in upstream's creation order: left, right, then the domain row.
+        let mut pieces: Vec<Row> = Vec::new();
+        let lcr_x_max = dx_min - space;
+        if lcr_x_max > core.x_min + site_dx {
+            pieces.push(Row {
+                name: format!("{}_1", row.name),
+                num_sites: (lcr_x_max - core.x_min) / site_dx,
+                x: core.x_min,
+                ..row.clone()
+            });
+        }
+
+        let rcr_x_min = make_site_loc(dx_max + space, site_dx, false, 0);
+        if rcr_x_min + site_dx < core.x_max {
+            pieces.push(Row {
+                name: format!("{}_2", row.name),
+                num_sites: (core.x_max - rcr_x_min) / site_dx,
+                x: rcr_x_min,
+                ..row.clone()
+            });
+        }
+
+        // The domain row itself, only where the row lies WHOLLY inside the domain's y range —
+        // the rows in the margin above and below lose their middle and get no replacement.
+        if y_min >= dy_min && y_max <= dy_max {
+            pieces.push(Row {
+                name: format!("{}_{}", row.name, domain.name),
+                num_sites: (dx_max - dx_min) / site_dx,
+                x: dx_min,
+                ..row.clone()
+            });
+        }
+
+        // ⬜ **A destroyed row with NO pieces leaves a HOLE**, and which later create fills it
+        // depends on odb's free-list discipline. No case in the corpus reaches that — every
+        // destroyed row in all three domain cases yields at least one piece — so it is left
+        // unmodelled rather than guessed at. See the divergence register.
+        let mut it = pieces.into_iter();
+        if let Some(first) = it.next() {
+            in_place.push(first);
+        }
+        appended.extend(it);
+    }
+    in_place.extend(appended);
+    in_place
+}
+
+#[cfg(test)]
+mod voltage_domain_tests {
+    use super::*;
+
+    fn row(name: &str, y: i32, site: &str) -> Row {
+        Row {
+            name: name.into(),
+            site: site.into(),
+            x: 0,
+            y,
+            orient: "N".into(),
+            num_sites: 100,
+            spacing: 10,
+        }
+    }
+
+    /// ⚠️ `at_left_from_macro` is `floor`, and the arithmetic goes through `double`.
+    #[test]
+    fn make_site_loc_floors_for_a_maximum_and_ceils_for_a_minimum() {
+        // 27 on a 10-wide grid: inward from below is 30, inward from above is 20.
+        assert_eq!(make_site_loc(27, 10, false, 0), 30, "ceil");
+        assert_eq!(make_site_loc(27, 10, true, 0), 20, "floor");
+        // Already on the grid: neither moves it.
+        assert_eq!(make_site_loc(30, 10, false, 0), 30);
+        assert_eq!(make_site_loc(30, 10, true, 0), 30);
+        // The offset is subtracted before and added back after.
+        assert_eq!(make_site_loc(27, 10, true, 5), 25);
+    }
+
+    /// ⛔ A row clear of the domain and its margin is untouched; a row crossing it is REPLACED by
+    /// its pieces, and the pieces are appended after every survivor.
+    #[test]
+    fn a_row_crossing_a_domain_is_replaced_and_the_first_piece_takes_its_place() {
+        let h = |_: &str| 10;
+        let pad = |_: &str| false;
+        // Core 0..1000 x 0..1000, domain 300..600 in both axes, gap 0 so the margin is exactly
+        // the domain box and only the crossing rows move.
+        let d = Domain {
+            name: "PD".into(),
+            bbox: Rect { x_min: 300, y_min: 300, x_max: 600, y_max: 600 },
+        };
+        let core = Rect { x_min: 0, y_min: 0, x_max: 1000, y_max: 1000 };
+        let rows = vec![row("ROW_0", 0, "s"), row("ROW_1", 400, "s"), row("ROW_2", 900, "s")];
+
+        let out = split_rows_for_domains(rows, &[d], core, Some(0), &h, &pad);
+        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ROW_0", "ROW_1_1", "ROW_2", "ROW_1_2", "ROW_1_PD"],
+            "the FIRST piece takes the destroyed row's place; the rest are appended"
+        );
+
+        let left = out.iter().find(|r| r.name == "ROW_1_1").unwrap();
+        assert_eq!((left.x, left.num_sites), (0, 30), "core_lx .. domain_x_min - gap");
+        let right = out.iter().find(|r| r.name == "ROW_1_2").unwrap();
+        assert_eq!((right.x, right.num_sites), (600, 40), "domain_x_max .. core_ux");
+        let mid = out.iter().find(|r| r.name == "ROW_1_PD").unwrap();
+        assert_eq!((mid.x, mid.num_sites), (300, 30), "across the domain itself");
+    }
+
+    /// ⛔ **The default margin is 6x the minimum site height, not zero** — so rows well clear of
+    /// the domain box are still rebuilt.
+    #[test]
+    fn the_default_margin_is_six_minimum_site_heights() {
+        let h = |_: &str| 10;
+        let pad = |_: &str| false;
+        let d = Domain {
+            name: "PD".into(),
+            bbox: Rect { x_min: 300, y_min: 300, x_max: 600, y_max: 600 },
+        };
+        let core = Rect { x_min: 0, y_min: 0, x_max: 1000, y_max: 1000 };
+        // The margin is 6 * 10 = 60, and the keep test is `y_max + space <= domain_y_min`.
+        //
+        // y=230 -> y_max 240, and 240 + 60 == 300 exactly, so the row is KEPT. The comparison is
+        // `<=`, and a row touching the margin edge survives.
+        let kept = split_rows_for_domains(vec![row("R", 230, "s")], &[d.clone()], core, None, &h, &pad);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "R", "exactly on the margin edge, so untouched");
+
+        // y=240 -> 250 + 60 > 300, one site height further in, and now it is rebuilt.
+        let out = split_rows_for_domains(vec![row("R", 240, "s")], &[d], core, None, &h, &pad);
+        assert!(out.iter().all(|r| r.name != "R"), "the row itself is gone");
+        let names: Vec<&str> = out.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["R_1", "R_2"], "_1 in place, _2 appended");
+        // ⚠️ It sits in the MARGIN, below the domain's own y range, so it gets NO domain row --
+        // the middle is simply lost.
+        assert!(out.iter().all(|r| r.name != "R_PD"), "margin rows lose their middle entirely");
+    }
+
+    /// A PAD row is never inspected and never destroyed — upstream leaves it out of the working
+    /// list altogether.
+    #[test]
+    fn pad_rows_are_left_alone() {
+        let h = |_: &str| 10;
+        let d = Domain {
+            name: "PD".into(),
+            bbox: Rect { x_min: 300, y_min: 300, x_max: 600, y_max: 600 },
+        };
+        let core = Rect { x_min: 0, y_min: 0, x_max: 1000, y_max: 1000 };
+        let out = split_rows_for_domains(
+            vec![row("PADROW", 400, "padsite")],
+            &[d],
+            core,
+            Some(0),
+            &h,
+            &|s| s == "padsite",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "PADROW", "a PAD row crossing the domain still survives");
+    }
+}
+
 // ---------------------------------------------------------------- make_tracks
 
 /// One layer's track pattern on one axis, exactly as `dbTrackGrid::addGridPattern*` takes it.

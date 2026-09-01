@@ -40,6 +40,7 @@ OPTIONS:
   --additional-sites A,B     also tile rows for these sites (hybrid rows)
   --row-parity NONE|ODD|EVEN trim the row count to a parity (default NONE)
   --flip-sites A,B           shift the row-orientation phase for these sites
+  --gap MICRONS              margin around a voltage domain (default: 6 x the site height)
   --out-odb FILE             write the database here (default: IN PLACE, over the input)
   --dry-run                  plan and report, write nothing
   -o FILE                    write the report to FILE instead of stdout
@@ -88,9 +89,11 @@ const DESCRIBE: &str = r#"{
       "Rows are named globally across sites (ROW_0, ROW_1, ...) rather than restarting per site, so adding a site renumbers the rows that follow it.",
       "Existing rows are cleared before the new ones are built. Anything already placed on the old row grid is not re-legalized by this engine.",
       "Written against the upstream ifp regression goldens at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated; where the two disagree the goldens are the arbiter.",
-      "MEASURED against that suite at the same pinned commit, re-run 2026-09-01: 23 cases reproduce every compared IFP-* line exactly, 0 fail, and 17 are not comparable (6 utilization form, 6 polygon floorplans, 3 that never call initialize_floorplan, 2 that need UPF). That number is about initialize_floorplan ALONE -- make-tracks, the engine's other command, is exercised by no case in that suite, so its correlation rests on unit tests rather than on the goldens.",
+      "MEASURED against that suite at the same pinned commit, re-run 2026-09-01, on THREE axes. Log lines: 23 cases reproduce every compared IFP-* line exactly, 0 fail, 17 not comparable (6 utilization form, 6 polygon floorplans, 3 that never call initialize_floorplan, 2 that need UPF). Track patterns: 8 of the 8 cases that call make_tracks match the reference database exactly, none skipped. Rows and die area, against the DEF goldens upstream ships: 21 comparable, of which 5 differed until the row cutting and the voltage-domain split landed. The log-line number alone was green throughout all five, which is why it is quoted last.",
       "HYBRID SITES are supported: a site with a row pattern tiles the core from that pattern (IFP-0049) and every hybrid site additionally gets rows spanning a whole pattern each (IFP-0050), offset to where its pattern occurs in the base pattern -- matching as written (R0) or reversed with orientations mirrored (MX). Row parity is REFUSED on a hybrid floorplan (IFP-0051), because parity would have to trim whole patterns rather than rows.",
       "Sites are visited in NAME order and deduplicated by name, not in the order given on the command line -- row numbering and log order both follow from this. The site set also includes sites used by placed instances that were never named as arguments (upstream addUsedSites), excluding blocks.",
+      "VOLTAGE AND POWER DOMAINS split the rows. A row crossing a domain group's region, or lying within a margin of it, is replaced by up to three pieces: one left of the domain, one right of it, and -- only where the row lies wholly inside the domain's y range -- one across the domain itself. The margin is --gap, or 6x the minimum site height when none is given. Rows on PAD sites are never touched. The split happens AFTER the core area and the per-site row counts are settled, so IFP-0001 and IFP-0102 report the floorplan before it.",
+      "ROWS ARE CUT against the block's placement blockages, using OpenDB's own cutRows rather than a reimplementation of it. This runs last and unconditionally; a design that declares no blockage is unaffected.",
       "SCOPE -- upstream ifp exposes FOUR commands and this engine implements TWO. initialize_floorplan is `run` and make_tracks is `make-tracks`; make_rows and insert_tiecells are NOT implemented. The row-building algorithm itself exists inside `run`, so what make_rows lacks is an entry point that builds rows on a die already set; insert_tiecells is absent entirely.",
       "Known gap -- UPF POWER DOMAINS. Upstream's floorplan inserts power-domain instances and its instance census rises accordingly (16 to 40 on upf_test); this engine inserts none. All floorplan GEOMETRY matches exactly on those cases; what differs is the instance census that follows from the count -- IFP-0103, IFP-0104 and IFP-0105 together.",
       "A macro larger than the core area is refused with IFP-0002 before anything is snapped or written, matching upstream's ordering: the die checks come first, so a design with both an empty die and an oversized macro reports the die. Pads and covers are exempt, and a master with R90 symmetry is measured against the core's larger dimension because it is free to rotate.",
@@ -142,6 +145,9 @@ struct Cli {
     out_odb: Option<String>,
     report: Option<String>,
     dry_run: bool,
+    /// `-gap` in MICRONS. `None` is upstream's `INT32_MIN` sentinel for "not given", which makes
+    /// the voltage-domain margin **6 x the minimum site height** instead.
+    gap_um: Option<f64>,
 }
 
 /// `x1 y1 x2 y2`, whitespace- or comma-separated.
@@ -181,6 +187,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         out_odb: None,
         report: None,
         dry_run: false,
+        gap_um: None,
     };
 
     let mut i = 0;
@@ -215,6 +222,17 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 let v = value()?;
                 cli.parity = RowParity::parse(&v)
                     .ok_or_else(|| format!("--row-parity wants NONE, ODD or EVEN, got `{v}`"))?;
+            }
+            "--gap" => {
+                // ⚠️ MICRONS here, converted once the database's scale is known -- the same
+                // shape as --die-area. Upstream's Tcl converts with `ord::microns_to_dbu` and
+                // leaves a sentinel when the option is absent.
+                let v = value()?;
+                cli.gap_um = Some(
+                    v.trim()
+                        .parse::<f64>()
+                        .map_err(|_| format!("--gap wants a number in microns, got `{v}`"))?,
+                );
             }
             "--out-odb" => cli.out_odb = Some(value()?),
             "-o" => cli.report = Some(value()?),
@@ -435,13 +453,58 @@ fn report_json(p: &Plan, dbu: f64, status: &str, odb_written: Option<&str>) -> S
 
 /// Write the plan into the database: die area, rows, then the core area the rows cover.
 ///
+/// Every voltage or power domain in the block, as `updateVoltageDomain` selects them.
+///
+/// ⛔ **The TYPE is the selector and there is no substitute for it.** A `PHYSICAL_CLUSTER` group
+/// can carry a name and a region just as a domain does, so filtering on "has a region" would be a
+/// guess that happens to hold on the designs at hand. `dbGroup::getType` was bound for this.
+///
+/// A group whose region has no boundaries contributes an empty box; upstream starts its bounds at
+/// the integer extremes and would carry those through, so such a group is dropped here rather than
+/// left to produce a nonsense rectangle.
+fn voltage_domains(db: &Db) -> Vec<vyges_ifp::Domain> {
+    let mut out = Vec::new();
+    for group in db.block_get_groups() {
+        match db.group_get_type(&group).unwrap_or_default().as_str() {
+            "VOLTAGE_DOMAIN" | "POWER_DOMAIN" => {}
+            _ => continue,
+        }
+        let region = db.group_get_region(&group);
+        if region.is_empty() {
+            continue;
+        }
+        let bounds = db.region_boundaries(&region).unwrap_or_default();
+        if bounds.is_empty() {
+            continue;
+        }
+        let bbox = vyges_ifp::Rect {
+            x_min: bounds.iter().map(|b| b.0).min().unwrap(),
+            y_min: bounds.iter().map(|b| b.1).min().unwrap(),
+            x_max: bounds.iter().map(|b| b.2).max().unwrap(),
+            y_max: bounds.iter().map(|b| b.3).max().unwrap(),
+        };
+        out.push(vyges_ifp::Domain { name: db.group_get_name(&group), bbox });
+    }
+    out
+}
+
 /// Order matters — the core area is *derived* from the rows (R9), so it cannot be set first.
-fn apply(db: &mut Db, p: &Plan) -> Result<(), String> {
+///
+/// ⛔ **And it is derived from the rows BEFORE any voltage-domain split.** Upstream sets it at the
+/// end of `makeUniformRows`, and only then does `makeRows` call `updateVoltageDomain`; deriving it
+/// from the split rows instead gives a different rectangle and moves IFP-0102 and IFP-0104. So the
+/// unsplit rows are written first, the core area is taken from them by odb's own
+/// `computeCoreArea`, and the split set replaces them afterwards.
+fn apply(db: &mut Db, p: &Plan, split: Option<&[vyges_ifp::Row]>) -> Result<(), String> {
     db.set_die_area(p.die.x_min, p.die.y_min, p.die.x_max, p.die.y_max)
         .map_err(|e| format!("cannot set the die area: {e}"))?;
     db.clear_rows()
         .map_err(|e| format!("cannot clear the existing rows: {e}"))?;
-    for r in &p.rows {
+    // ⛔ **Written ONCE, in the order the planner decided.** Clearing and re-creating a second
+    // time does not reproduce that order: `clear_rows` frees every table slot and the next
+    // creations reuse them, so a write-then-rewrite scrambles the row list. The voltage-domain
+    // split is therefore computed before anything is written, not applied to written rows.
+    for r in split.unwrap_or(&p.rows) {
         db.create_row(
             &r.name,
             &r.site,
@@ -454,8 +517,28 @@ fn apply(db: &mut Db, p: &Plan) -> Result<(), String> {
         )
         .map_err(|e| format!("cannot create {}: {e}", r.name))?;
     }
-    db.set_core_area_from_rows()
-        .map_err(|e| format!("cannot set the core area: {e}"))
+    // ⛔ **The core area comes from the plan, which derived it from the rows BEFORE the split.**
+    // Upstream sets it at the end of `makeUniformRows` and splits afterwards, so asking odb to
+    // recompute it from what is now in the database would give a different rectangle -- that
+    // regressed IFP-0102 and IFP-0104 on two cases before this line was written. `p.core_final`
+    // is the same value the engine reports as IFP-0101, which the goldens already agree with.
+    db.set_core_area(
+        p.core_final.x_min,
+        p.core_final.y_min,
+        p.core_final.x_max,
+        p.core_final.y_max,
+    )
+    .map_err(|e| format!("cannot set the core area: {e}"))?;
+
+    // ⛔ **LAST, and unconditional** — upstream's `makeRows` ends by handing every `dbBlockage` in
+    // the block to `odb::cutRows`, outside the non-negative-core guard, and `cutRows` returns at
+    // once when there are none. Both zeros are upstream's own arguments: `min_row_height` 0
+    // disables odb's narrow-region removal, and the halos are 0.
+    //
+    // ⚠️ It runs AFTER the core area is set, which is upstream's order too — cutting rows does not
+    // change the core area that was already derived from the uncut ones.
+    db.cut_rows_at_blockages(0, 0, 0, 0)
+        .map_err(|e| format!("cannot cut the rows around the blockages: {e}"))
 }
 
 /// A refusal is a verdict about the design, not a crash: exit 1, and nothing was written.
@@ -639,7 +722,7 @@ fn run(args: &[String]) -> ExitCode {
         })
         .collect();
 
-    let p = match plan(
+    let mut p = match plan(
         rect(cli.die),
         rect(cli.core),
         &sites,
@@ -652,9 +735,52 @@ fn run(args: &[String]) -> ExitCode {
         Err(e) => return refuse(e, dbu_f),
     };
 
+    // ⛔ **`updateVoltageDomain` runs AFTER the core area and the row counts are settled**, and
+    // that ordering is load-bearing: upstream's `makeUniformRows` ends with
+    // `setCoreArea(computeCoreArea())` and prints IFP-0001 from the rows it made, and only then
+    // does `makeRows` split them around the domains. Splitting earlier would change both the
+    // reported core area and the row counts.
+    // ⛔ The split rows are kept SEPARATE from the plan's own, because the core area and the
+    // per-site counts are derived from the rows BEFORE the split -- see `apply`.
+    let mut split_rows: Option<Vec<vyges_ifp::Row>> = None;
+    let domains = voltage_domains(&db);
+    if !domains.is_empty() {
+        // ⚠️ IFP-36: any gap that is given must be positive. Upstream's sentinel for "not given"
+        // is INT32_MIN, and `None` is ours -- the margin then falls back to 6 x the minimum site
+        // height rather than to a number the caller never chose.
+        let gap = match cli.gap_um {
+            None => None,
+            Some(um) => {
+                let g = vyges_ifp::microns_to_mfg_grid(um, dbu, grid.unwrap_or(0));
+                if g <= 0 {
+                    eprintln!("vyges-ifp: IFP-0036 Gap must be positive ({g})");
+                    return ExitCode::from(1);
+                }
+                Some(g)
+            }
+        };
+        let heights: std::collections::HashMap<String, i32> =
+            sites.iter().map(|s| (s.name.clone(), s.height)).collect();
+        let pads: std::collections::HashSet<String> = sites
+            .iter()
+            .filter(|s| {
+                db.site_get_class(&s.name).unwrap_or_default() == "PAD"
+            })
+            .map(|s| s.name.clone())
+            .collect();
+        split_rows = Some(vyges_ifp::split_rows_for_domains(
+            p.rows.clone(),
+            &domains,
+            p.core_snapped,
+            gap,
+            &|site| heights.get(site).copied().unwrap_or(0),
+            &|site| pads.contains(site),
+        ));
+    }
+
     let mut written: Option<String> = None;
     if !cli.dry_run {
-        if let Err(e) = apply(&mut db, &p) {
+        if let Err(e) = apply(&mut db, &p, split_rows.as_deref()) {
             eprintln!("vyges-ifp: {e}");
             return ExitCode::from(2);
         }
