@@ -25,9 +25,14 @@ vyges physical ifp — initialize the floorplan: die area, core area, and rows
 USAGE:
   vyges physical ifp run <design.odb> --die-area 'x1 y1 x2 y2' --core-area 'x1 y1 x2 y2' --site NAME
   vyges physical ifp run <design.odb> --utilization PCT --core-space 'b t l r' --site NAME
+  vyges physical ifp make-rows <design.odb> --core-area 'x1 y1 x2 y2' --site NAME
   vyges physical ifp make-tracks <design.odb> [--track LAYER:xoff,xpitch,yoff,ypitch]... [--out-odb FILE]
   vyges physical ifp --describe
   vyges physical ifp --help
+
+MAKE-ROWS:
+  Rows on a die that is ALREADY set: same options as run minus the die, with the core given
+  either explicitly (--core-area) or as margins off the die (--core-space).
 
 MAKE-TRACKS:
   Routing tracks over the die, from the technology's own pitches. With no --track, every ROUTING
@@ -100,7 +105,8 @@ const DESCRIBE: &str = r#"{
       "Sites are visited in NAME order and deduplicated by name, not in the order given on the command line -- row numbering and log order both follow from this. The site set also includes sites used by placed instances that were never named as arguments (upstream addUsedSites), excluding blocks.",
       "VOLTAGE AND POWER DOMAINS split the rows. A row crossing a domain group's region, or lying within a margin of it, is replaced by up to three pieces: one left of the domain, one right of it, and -- only where the row lies wholly inside the domain's y range -- one across the domain itself. The margin is --gap, or 6x the minimum site height when none is given. Rows on PAD sites are never touched. The split happens AFTER the core area and the per-site row counts are settled, so IFP-0001 and IFP-0102 report the floorplan before it.",
       "ROWS ARE CUT against the block's placement blockages, using OpenDB's own cutRows rather than a reimplementation of it. This runs last and unconditionally; a design that declares no blockage is unaffected.",
-      "SCOPE -- upstream ifp exposes FOUR commands and this engine implements TWO. initialize_floorplan is `run` and make_tracks is `make-tracks`; make_rows and insert_tiecells are NOT implemented. The row-building algorithm itself exists inside `run`, so what make_rows lacks is an entry point that builds rows on a die already set; insert_tiecells is absent entirely.",
+      "SCOPE -- upstream ifp exposes FOUR commands and this engine implements THREE: initialize_floorplan is `run`, make_rows is `make-rows`, make_tracks is `make-tracks`. insert_tiecells is NOT implemented.",
+      "make-rows builds rows on a die the database already holds and never writes a die of its own. The core is given explicitly or as margins off that die, and an empty die is refused with IFP-63 or IFP-64 depending on which of the two forms was used -- upstream uses two codes for the one condition.",
       "Known gap -- UPF POWER DOMAINS. Upstream's floorplan inserts power-domain instances and its instance census rises accordingly (16 to 40 on upf_test); this engine inserts none. All floorplan GEOMETRY matches exactly on those cases; what differs is the instance census that follows from the count -- IFP-0103, IFP-0104 and IFP-0105 together.",
       "A macro larger than the core area is refused with IFP-0002 before anything is snapped or written, matching upstream's ordering: the die checks come first, so a design with both an empty die and an oversized macro reports the die. Pads and covers are exempt, and a master with R90 symmetry is measured against the core's larger dimension because it is free to rotate.",
       "The instance census (IFP-0103 total instance area, IFP-0104 effective utilization) counts EVERY instance's master area, including the pads and covers the fit check skips -- it is a census of the design, not a question about the core. Utilization is omitted rather than printed as infinity when the core area is zero.",
@@ -166,6 +172,9 @@ struct Cli {
     /// POLYGON floorplan** — upstream tests exactly that and switches the whole command over.
     die_pts: Vec<f64>,
     core_pts: Vec<f64>,
+    /// `make_rows` rather than `initialize_floorplan`: the die is READ from the database instead
+    /// of written, and everything else about row building is the same.
+    make_rows: bool,
 }
 
 /// `x1 y1 x2 y2`, whitespace- or comma-separated.
@@ -201,7 +210,19 @@ fn to_dbu(microns: f64, dbu: f64) -> i32 {
     (microns * dbu).round() as i32
 }
 
+/// `make_rows` is `initialize_floorplan` with the die left alone: same row parameters, same
+/// `-core_area` / `-core_space` choice, and no die argument at all.
+fn parse_args_make_rows(args: &[String]) -> Result<Cli, String> {
+    let mut cli = parse_args_inner(args, true)?;
+    cli.make_rows = true;
+    Ok(cli)
+}
+
 fn parse_args(args: &[String]) -> Result<Cli, String> {
+    parse_args_inner(args, false)
+}
+
+fn parse_args_inner(args: &[String], make_rows: bool) -> Result<Cli, String> {
     let mut odb: Option<String> = None;
     let (mut die, mut core, mut site) = (None, None, None);
     let mut cli = Cli {
@@ -218,6 +239,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         gap_um: None,
         die_pts: Vec::new(),
         core_pts: Vec::new(),
+        make_rows: false,
         utilization: None,
         aspect_ratio: None,
         core_space: None,
@@ -308,8 +330,26 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         i += 1;
     }
 
-    cli.odb = odb.ok_or("`run` needs a path to a .odb")?;
-    cli.site = site.ok_or("`run` needs --site")?;
+    cli.odb = odb.ok_or("needs a path to a .odb")?;
+    // ⛔ IFP-35 is upstream's own message, and `-site` is required by BOTH commands: it is
+    // `parse_row_params` that demands it, and both helpers call that first.
+    cli.site = site.ok_or("IFP-0035 use -site to add placement rows.")?;
+
+    if make_rows {
+        // ⛔ `make_rows_helper` takes `-core_area` if present, else `-core_space`, else IFP-62.
+        // There is no die argument: the die is whatever the database already holds.
+        if die.is_some() || !cli.die_pts.is_empty() {
+            return Err("make-rows does not take a die area; it uses the one already set"
+                       .to_string());
+        }
+        if let Some(c) = core {
+            cli.core = c;
+        } else if cli.core_space.is_none() {
+            return Err("IFP-0062 no -core_area or -core_space specified.".to_string());
+        }
+        return Ok(cli);
+    }
+
 
     // ⛔ Upstream's own exclusions, with its own message ids. `-utilization` derives the die, so
     // an explicit die or core is a contradiction rather than an override.
@@ -592,9 +632,17 @@ fn voltage_domains(db: &Db) -> Vec<vyges_ifp::Domain> {
 /// from the split rows instead gives a different rectangle and moves IFP-0102 and IFP-0104. So the
 /// unsplit rows are written first, the core area is taken from them by odb's own
 /// `computeCoreArea`, and the split set replaces them afterwards.
-fn apply(db: &mut Db, p: &Plan, split: Option<&[vyges_ifp::Row]>) -> Result<(), String> {
-    db.set_die_area(p.die.x_min, p.die.y_min, p.die.x_max, p.die.y_max)
-        .map_err(|e| format!("cannot set the die area: {e}"))?;
+fn apply(db: &mut Db, p: &Plan, split: Option<&[vyges_ifp::Row]>, set_die: bool)
+    -> Result<(), String>
+{
+    // ⛔ `make_rows` does not write a die — it builds rows on the one already there. Writing the
+    // plan's die back would look harmless (it is the same rectangle, read from this database) but
+    // `plan` snaps it to the manufacturing grid first, so a die that was NOT on the grid would be
+    // silently moved by a command that has no business touching it.
+    if set_die {
+        db.set_die_area(p.die.x_min, p.die.y_min, p.die.x_max, p.die.y_max)
+            .map_err(|e| format!("cannot set the die area: {e}"))?;
+    }
     db.clear_rows()
         .map_err(|e| format!("cannot clear the existing rows: {e}"))?;
     // ⛔ **Written ONCE, in the order the planner decided.** Clearing and re-creating a second
@@ -969,14 +1017,32 @@ fn run_polygon(
 }
 
 fn run(args: &[String]) -> ExitCode {
-    let cli = match parse_args(args) {
-        Ok(c) => c,
+    match parse_args(args) {
+        Ok(cli) => run_with(cli),
         Err(e) => {
             eprintln!("vyges-ifp: {e}\n\n{USAGE}");
-            return ExitCode::from(2);
+            ExitCode::from(2)
         }
-    };
+    }
+}
 
+/// `make-rows`: upstream's second command. Rows on a die that is ALREADY set.
+///
+/// 🔑 **The die is read, never written.** `makeRows` starts from `block_->getDieArea()` and errors
+/// IFP-63 when it is empty; `makeRowsWithSpacing` does the same with IFP-64 and then derives the
+/// core by insetting that die. Everything after the core is fixed is the same row building
+/// `initialize_floorplan` does, which is why this shares its body rather than copying it.
+fn make_rows_cmd(args: &[String]) -> ExitCode {
+    match parse_args_make_rows(args) {
+        Ok(cli) => run_with(cli),
+        Err(e) => {
+            eprintln!("vyges-ifp: {e}\n\n{USAGE}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run_with(cli: Cli) -> ExitCode {
     let mut db = match Db::open(&cli.odb) {
         Ok(db) => db,
         Err(e) => {
@@ -1144,7 +1210,34 @@ fn run(args: &[String]) -> ExitCode {
         return run_polygon(&mut db, &cli, dbu, dbu_f, grid, gap, &sites, &instances);
     }
 
-    let (die_in, core_in) = match cli.utilization {
+    // ⛔ **`make_rows` READS the die; it never writes one.** `makeRows` errors IFP-63 on an empty
+    // die and `makeRowsWithSpacing` errors IFP-64 — two codes for the same condition, chosen by
+    // which form the caller used, so the code carries which helper was reached.
+    let (die_in, core_in) = if cli.make_rows {
+        let die = Rect::new(
+            db.block_get_die_area_x_min(), db.block_get_die_area_y_min(),
+            db.block_get_die_area_x_max(), db.block_get_die_area_y_max(),
+        );
+        if die.is_empty() {
+            let code = if cli.core_space.is_some() { "0064" } else { "0063" };
+            vyges_events::emit(&vyges_events::Event::new(
+                "vyges-ifp",
+                vyges_events::Severity::Error,
+                format!("IFP-{code} Floorplan die area is 0. Cannot build rows."),
+            ).with_code("IFP-EMPTY-DIE"));
+            return ExitCode::from(1);
+        }
+        let core = match cli.core_space {
+            Some(sp) => vyges_ifp::core_from_die_spacing(
+                die,
+                to_dbu(sp[0], dbu_f), to_dbu(sp[1], dbu_f),
+                to_dbu(sp[2], dbu_f), to_dbu(sp[3], dbu_f),
+            ),
+            None => rect(cli.core),
+        };
+        (die, core)
+    } else {
+    match cli.utilization {
         None => (rect(cli.die), rect(cli.core)),
         Some(util) => {
             let sp = cli.core_space.expect("checked when the arguments were parsed");
@@ -1190,6 +1283,7 @@ fn run(args: &[String]) -> ExitCode {
             );
             (snapped, vyges_ifp::core_from_die_spacing(snapped, b, t, l, r))
         }
+    }
     };
 
     let mut p = match plan(
@@ -1236,7 +1330,7 @@ fn run(args: &[String]) -> ExitCode {
 
     let mut written: Option<String> = None;
     if !cli.dry_run {
-        if let Err(e) = apply(&mut db, &p, split_rows.as_deref()) {
+        if let Err(e) = apply(&mut db, &p, split_rows.as_deref(), !cli.make_rows) {
             eprintln!("vyges-ifp: {e}");
             return ExitCode::from(2);
         }
@@ -1560,6 +1654,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         };
     }
+    if args[0] == "make-rows" {
+        return make_rows_cmd(&args[1..]);
+    }
     if args[0] == "make-tracks" {
         return make_tracks(&args[1..]);
     }
@@ -1613,7 +1710,9 @@ mod tests {
         .map(String::from);
         assert!(parse_args(&base).is_ok());
 
-        for (drop_at, expect) in [(1, "--die-area"), (3, "--core-area"), (5, "--site")] {
+        // ⚠️ `--site` is named by UPSTREAM'S message (IFP-0035), not by our option spelling: it is
+        // `parse_row_params` that demands it, and both commands reach that first.
+        for (drop_at, expect) in [(1, "--die-area"), (3, "--core-area"), (5, "IFP-0035")] {
             let mut a: Vec<String> = base.to_vec();
             a.drain(drop_at..drop_at + 2);
             let e = parse_args(&a).expect_err("must refuse");
