@@ -24,6 +24,7 @@ vyges physical ifp — initialize the floorplan: die area, core area, and rows
 
 USAGE:
   vyges physical ifp run <design.odb> --die-area 'x1 y1 x2 y2' --core-area 'x1 y1 x2 y2' --site NAME
+  vyges physical ifp run <design.odb> --utilization PCT --core-space 'b t l r' --site NAME
   vyges physical ifp make-tracks <design.odb> [--track LAYER:xoff,xpitch,yoff,ypitch]... [--out-odb FILE]
   vyges physical ifp --describe
   vyges physical ifp --help
@@ -35,6 +36,10 @@ MAKE-TRACKS:
 
 OPTIONS:
   --die-area 'x1 y1 x2 y2'   die rectangle, in MICRONS
+  --utilization PCT          derive the die from the placed cell area instead of giving it
+  --aspect-ratio R           height/width for the derived core (default 1.0)
+  --core-space 'b t l r'     margins in MICRONS, or ONE value for all four; required with
+                             --utilization and refused with --die-area
   --core-area 'x1 y1 x2 y2'  core rectangle, in MICRONS
   --site NAME                the base site whose height sets the row pitch
   --additional-sites A,B     also tile rows for these sites (hybrid rows)
@@ -83,7 +88,8 @@ const DESCRIBE: &str = r#"{
   "maturity": "structured",
   "provenance_limitations": [
       "input_hash covers the argument vector, not the content of the .odb it names.",
-      "Implements the explicit-rectangle form of initialize_floorplan (die area plus core area). The utilization/aspect-ratio form, which derives the die from the placed cell area, is NOT implemented; ask for it with explicit rectangles.",
+      "Implements BOTH forms of initialize_floorplan. Give --die-area and --core-area explicitly, or give --utilization with --core-space and the die is derived from the placed cell area. The two are mutually exclusive, as upstream has them: --die-area with --utilization is refused (IFP-14), and so is --core-area (IFP-20).",
+      "The utilization form is TWO steps and the intermediate matters. The die is derived first -- core_width from sqrt(design area / utilization / aspect ratio) TRUNCATED to a whole DBU, core_height ROUNDED from that already-truncated width -- and then snapped to the manufacturing grid. The core is taken back off the SNAPPED die by subtracting the same margins, so it is not the rectangle the die computation laid out. Both are upstream behaviours.",
       "Areas are given in MICRONS, matching the upstream Tcl argument, and converted with the database's dbu_per_micron. A database with no DBU scale is an error rather than an assumed scale.",
       "The core's lower left is snapped UP to the site grid while the upper right is left where it was; the core area finally stored is what the rows COVER, not what was asked for. Both are upstream behaviors and both are load-bearing -- a caller that reads back the core area will not always get its own argument.",
       "Rows are named globally across sites (ROW_0, ROW_1, ...) rather than restarting per site, so adding a site renumbers the rows that follow it.",
@@ -148,6 +154,14 @@ struct Cli {
     /// `-gap` in MICRONS. `None` is upstream's `INT32_MIN` sentinel for "not given", which makes
     /// the voltage-domain margin **6 x the minimum site height** instead.
     gap_um: Option<f64>,
+    /// `-utilization` as a PERCENTAGE. When present the die is derived rather than given, and
+    /// `--die-area`/`--core-area` are refused (upstream IFP-14 and IFP-20).
+    utilization: Option<f64>,
+    /// `-aspect_ratio`; upstream's default is **1.0**, not the core's shape.
+    aspect_ratio: Option<f64>,
+    /// `-core_space` in MICRONS, as (bottom, top, left, right). One value on the command line
+    /// fills all four, which is upstream's own shorthand.
+    core_space: Option<[f64; 4]>,
 }
 
 /// `x1 y1 x2 y2`, whitespace- or comma-separated.
@@ -188,6 +202,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         report: None,
         dry_run: false,
         gap_um: None,
+        utilization: None,
+        aspect_ratio: None,
+        core_space: None,
     };
 
     let mut i = 0;
@@ -223,6 +240,33 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 cli.parity = RowParity::parse(&v)
                     .ok_or_else(|| format!("--row-parity wants NONE, ODD or EVEN, got `{v}`"))?;
             }
+            "--utilization" => {
+                let v = value()?;
+                cli.utilization = Some(v.trim().parse::<f64>()
+                    .map_err(|_| format!("--utilization wants a percentage, got `{v}`"))?);
+            }
+            "--aspect-ratio" => {
+                let v = value()?;
+                cli.aspect_ratio = Some(v.trim().parse::<f64>()
+                    .map_err(|_| format!("--aspect-ratio wants a number, got `{v}`"))?);
+            }
+            "--core-space" => {
+                // ⚠️ ONE value fills all four sides; FOUR are BOTTOM TOP LEFT RIGHT, which is
+                // upstream's order and not the (left, bottom, right, top) a rectangle suggests.
+                let v = value()?;
+                let f: Vec<f64> = v
+                    .split_whitespace()
+                    .map(|t| t.parse::<f64>().map_err(|_| format!("--core-space: not a number: `{t}`")))
+                    .collect::<Result<_, _>>()?;
+                cli.core_space = Some(match f.len() {
+                    1 => [f[0], f[0], f[0], f[0]],
+                    4 => [f[0], f[1], f[2], f[3]],
+                    // Upstream IFP-13, with its own words.
+                    _ => return Err(
+                        "IFP-0013 -core_space is either a list of 4 margins or one value for all \
+                         margins.".to_string()),
+                });
+            }
             "--gap" => {
                 // ⚠️ MICRONS here, converted once the database's scale is known -- the same
                 // shape as --die-area. Upstream's Tcl converts with `ord::microns_to_dbu` and
@@ -245,9 +289,32 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     }
 
     cli.odb = odb.ok_or("`run` needs a path to a .odb")?;
-    cli.die = die.ok_or("`run` needs --die-area")?;
-    cli.core = core.ok_or("`run` needs --core-area")?;
     cli.site = site.ok_or("`run` needs --site")?;
+
+    // ⛔ Upstream's own exclusions, with its own message ids. `-utilization` derives the die, so
+    // an explicit die or core is a contradiction rather than an override.
+    if cli.utilization.is_some() {
+        if die.is_some() {
+            return Err("IFP-0014 -die_area cannot be used with -utilization.".to_string());
+        }
+        if core.is_some() {
+            return Err("IFP-0020 -core_area cannot be used with -utilization.".to_string());
+        }
+        // IFP-34: the spacings are what place the core inside the derived die, so there is no
+        // default for them.
+        if cli.core_space.is_none() {
+            return Err("IFP-0034 no -core_space specified.".to_string());
+        }
+    } else {
+        if cli.aspect_ratio.is_some() {
+            return Err("IFP-0033 -aspect_ratio cannot be used with -die_area.".to_string());
+        }
+        if cli.core_space.is_some() && die.is_some() {
+            return Err("IFP-0024 -core_space cannot be used with -die_area.".to_string());
+        }
+        cli.die = die.ok_or("`run` needs --die-area or --utilization")?;
+        cli.core = core.ok_or("`run` needs --core-area")?;
+    }
     Ok(cli)
 }
 
@@ -545,7 +612,7 @@ fn apply(db: &mut Db, p: &Plan, split: Option<&[vyges_ifp::Row]>) -> Result<(), 
 fn refuse(e: PlanError, dbu: f64) -> ExitCode {
     use vyges_events::{Event, Severity};
     let code = match e {
-        PlanError::NoRows => "IFP-NO-ROWS",
+        PlanError::NoRows { .. } => "IFP-NO-ROWS",
         PlanError::CoreNotInDie => "IFP-CORE-OUTSIDE-DIE",
         PlanError::EmptyDieArea => "IFP-EMPTY-DIE",
         PlanError::InstanceDoesNotFit { .. } => "IFP-INST-TOO-BIG",
@@ -554,9 +621,43 @@ fn refuse(e: PlanError, dbu: f64) -> ExitCode {
         _ => "IFP-BAD-SITE",
     };
     let um = |v: i32| (v as f64) / dbu;
+
+    // ⛔ **Upstream had already printed two things by the time it failed**, and the goldens
+    // assert both: `makeRows` warns IFP-0028 when the core's lower left moved to the site grid,
+    // and `makeUniformRows` warns IFP-0061 for every site that produced no rows. Only then does
+    // IFP-0065 abort. Emitting the error alone is a faithful message in the wrong call sequence.
+    if let PlanError::NoRows { core_requested, core_snapped, ref empty_sites } = e {
+        if core_snapped.x_min != core_requested.x_min || core_snapped.y_min != core_requested.y_min
+        {
+            vyges_events::emit(
+                &Event::new(
+                    "vyges-ifp",
+                    Severity::Warn,
+                    format!(
+                        "IFP-0028 Core area lower left ({:.3}, {:.3}) snapped to ({:.3}, {:.3}).",
+                        um(core_requested.x_min), um(core_requested.y_min),
+                        um(core_snapped.x_min), um(core_snapped.y_min)
+                    ),
+                )
+                .with_code("IFP-CORE-SNAPPED"),
+            );
+        }
+        for site in empty_sites {
+            vyges_events::emit(
+                &Event::new(
+                    "vyges-ifp",
+                    Severity::Warn,
+                    format!("IFP-0061 No rows created for site {site}."),
+                )
+                .with_code("IFP-NO-ROWS-FOR-SITE")
+                .with_objects(vec![format!("site:{site}")]),
+            );
+        }
+    }
+
     let text = match e {
         // The ones the goldens name, in their words.
-        PlanError::NoRows => "IFP-0065 No rows created in the core area.".to_string(),
+        PlanError::NoRows { .. } => "IFP-0065 No rows created in the core area.".to_string(),
         PlanError::ParityWithHybridRows => {
             "IFP-0051 Constraining row parity is not supported for hybrid rows.".to_string()
         }
@@ -722,9 +823,62 @@ fn run(args: &[String]) -> ExitCode {
         })
         .collect();
 
+    // ⛔ **The `-utilization` form is TWO steps, not one**, and upstream runs them through
+    // separate Tcl helpers: `make_die_helper` derives and SETS the die, then `make_rows_helper`
+    // re-derives the core from that die minus the same spacings. The die is snapped to the
+    // manufacturing grid in between, so the core is NOT the rectangle the die computation laid
+    // out — reproducing that two-step is the whole point.
+    let (die_in, core_in) = match cli.utilization {
+        None => (rect(cli.die), rect(cli.core)),
+        Some(util) => {
+            let sp = cli.core_space.expect("checked when the arguments were parsed");
+            let aspect = cli.aspect_ratio.unwrap_or(1.0);   // upstream's default is 1.0
+            // Upstream's validators, in its own order: IFP-12 then IFP-36, then the spacings.
+            if util < 0.0 {
+                eprintln!("vyges-ifp: IFP-0012 utilization must be non-negative ({util})");
+                return ExitCode::from(1);
+            }
+            if aspect <= 0.0 {
+                eprintln!("vyges-ifp: IFP-0036 aspect_ratio must be positive ({aspect})");
+                return ExitCode::from(1);
+            }
+            // IFP-32..35, one per side, checked in MICRONS as upstream does.
+            for (v, code, what) in [
+                (sp[0], 32, "core_space_bottom"), (sp[1], 33, "core_space_top"),
+                (sp[2], 34, "core_space_left"), (sp[3], 35, "core_space_right"),
+            ] {
+                if v < 0.0 {
+                    eprintln!("vyges-ifp: IFP-00{code} {what} (um) must be non-negative ({v})");
+                    return ExitCode::from(1);
+                }
+            }
+            let (b, t, l, r) = (to_dbu(sp[0], dbu_f), to_dbu(sp[1], dbu_f),
+                                to_dbu(sp[2], dbu_f), to_dbu(sp[3], dbu_f));
+            vyges_events::emit(
+                &vyges_events::Event::new(
+                    "vyges-ifp",
+                    vyges_events::Severity::Info,
+                    format!("IFP-0107 Defining die area using utilization: {util:.2}% and \
+                             aspect ratio: {aspect}."),
+                )
+                .with_code("IFP-DIE-FROM-UTILIZATION"),
+            );
+            let area = vyges_ifp::design_area(&instances);
+            let die = vyges_ifp::die_from_utilization(area, util, aspect, b, t, l, r);
+            // `makeDie` snaps every corner before the core is taken back off it.
+            let snapped = Rect::new(
+                vyges_ifp::snap_to_mfg_grid(die.x_min, grid),
+                vyges_ifp::snap_to_mfg_grid(die.y_min, grid),
+                vyges_ifp::snap_to_mfg_grid(die.x_max, grid),
+                vyges_ifp::snap_to_mfg_grid(die.y_max, grid),
+            );
+            (snapped, vyges_ifp::core_from_die_spacing(snapped, b, t, l, r))
+        }
+    };
+
     let mut p = match plan(
-        rect(cli.die),
-        rect(cli.core),
+        die_in,
+        core_in,
         &sites,
         cli.parity,
         &cli.flipped,

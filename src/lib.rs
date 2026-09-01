@@ -209,7 +209,19 @@ pub enum PlanError {
     /// An additional site's height is not a multiple of the base site's (upstream IFP-54).
     SiteHeightNotMultiple { site: String, base: String },
     /// No site produced a single row (upstream IFP-65).
-    NoRows,
+    /// No row fits the core (upstream IFP-0065).
+    ///
+    /// ⛔ **Carries what upstream had ALREADY PRINTED when it failed.** `makeRows` warns IFP-0028
+    /// if the core's lower left moved, and `makeUniformRows` warns IFP-0061 for each site that
+    /// produced no rows — both BEFORE the fatal IFP-0065. Reporting only the error loses two
+    /// lines the goldens assert, and `init_floorplan12` is the case that says so.
+    NoRows {
+        /// The core as asked for, and after the site-grid snap — IFP-0028 compares the two.
+        core_requested: Rect,
+        core_snapped: Rect,
+        /// Sites that yielded no rows, in the order they were visited — one IFP-0061 each.
+        empty_sites: Vec<String>,
+    },
     /// Row parity was asked for on a hybrid floorplan (upstream IFP-51).
     ParityWithHybridRows,
     /// A site's row pattern does not occur in the base site's (upstream IFP-48).
@@ -228,7 +240,7 @@ impl std::fmt::Display for PlanError {
                     "site {site} height is not a multiple of site {base} height"
                 )
             }
-            PlanError::NoRows => write!(f, "no rows created in the core area"),
+            PlanError::NoRows { .. } => write!(f, "no rows created in the core area"),
             PlanError::ParityWithHybridRows => {
                 write!(
                     f,
@@ -379,7 +391,11 @@ pub fn plan(
         return Err(PlanError::CoreNotInDie);
     }
     check_instance_dimensions(instances, core)?;
-    let base = sites.first().ok_or(PlanError::NoRows)?;
+    let base = sites.first().ok_or_else(|| PlanError::NoRows {
+        core_requested: core,
+        core_snapped: core,
+        empty_sites: Vec::new(),
+    })?;
     for s in sites {
         if s.width <= 0 || s.height <= 0 {
             return Err(PlanError::DegenerateSite(s.name.clone()));
@@ -441,7 +457,12 @@ pub fn plan(
         rows_per_site.push((site.name.clone(), rows_y));
     }
     if rows.is_empty() {
-        return Err(PlanError::NoRows);
+        return Err(PlanError::NoRows {
+            core_requested: core,
+            core_snapped,
+            empty_sites: rows_per_site.iter().filter(|(_, n)| *n == 0)
+                .map(|(s, _)| s.clone()).collect(),
+        });
     }
 
     // R9: the core area becomes what the rows cover, not what was asked for.
@@ -587,7 +608,12 @@ fn plan_hybrid(
     }
 
     if rows.is_empty() {
-        return Err(PlanError::NoRows);
+        return Err(PlanError::NoRows {
+            core_requested,
+            core_snapped: core,
+            empty_sites: rows_per_site.iter().filter(|(_, n)| *n == 0)
+                .map(|(s, _)| s.clone()).collect(),
+        });
     }
     let core_final = Rect {
         x_min: core.x_min,
@@ -1243,7 +1269,13 @@ mod tests {
                 None,
                 &[]
             ),
-            Err(PlanError::NoRows)
+            Err(PlanError::NoRows {
+                core_requested: Rect::new(0, 0, 10, 10),
+                core_snapped: Rect::new(0, 0, 10, 10),
+                // ⚠️ The site is VISITED and yields zero rows, so upstream names it in an
+                // IFP-0061 before the fatal IFP-0065 — the error carries that list.
+                empty_sites: vec!["FreePDK45_38x28_10R_NP_162NW_34O".to_string()],
+            })
         );
         let odd = Site::plain("odd", 380, 2800 + 1);
         assert!(matches!(
@@ -1258,6 +1290,75 @@ mod tests {
             ),
             Err(PlanError::SiteHeightNotMultiple { .. })
         ));
+    }
+}
+
+// --------------------------------------------------------------- utilization
+
+/// Upstream `InitFloorplan::makeDieUtilization` — derive the DIE from the placed cell area.
+///
+/// 🔑 **The whole rule, transcribed** (`ifp/src/InitFloorplan.cc:151`):
+///
+/// ```text
+/// utilization /= 100
+/// core_area   = designArea() / utilization
+/// core_width  = std::sqrt(core_area / aspect_ratio)     // int = double expr -> TRUNCATES
+/// core_height = round(core_width * aspect_ratio)        // ROUNDS, from the TRUNCATED width
+/// core_lx/ly  = core_space_left / core_space_bottom
+/// die         = (0, 0, core_lx + core_width + core_space_right,
+///                      core_ly + core_height + core_space_top)
+/// ```
+///
+/// ⚠️ **The width truncates and the height rounds**, and the height is computed from the
+/// *already truncated* width. Writing both the same way is the natural Rust and is wrong.
+///
+/// ⚠️ **The die origin is always (0, 0)** — the spacings push the core inward, they do not move
+/// the die.
+///
+/// ℹ️ This returns the die BEFORE the manufacturing-grid snap; `makeDie` applies that, and the
+/// core is then re-derived from the SNAPPED die by [`core_from_die_spacing`], not from the
+/// rectangle this function had in mind.
+///
+/// Checked by hand against `init_floorplan2`'s golden at pin `945a9f4`: design area 15.428 um²
+/// at 30% and aspect 0.5 gives `core_width` 20283 and `core_height` 10142, so the die is
+/// (0, 0, 24283, 14142) and snaps on Nangate45's 10-DBU grid to the golden's 12.140 x 7.070 um.
+pub fn die_from_utilization(
+    design_area: f64,
+    utilization: f64,
+    aspect_ratio: f64,
+    space_bottom: i32,
+    space_top: i32,
+    space_left: i32,
+    space_right: i32,
+) -> Rect {
+    let utilization = utilization / 100.0;
+    let core_area = design_area / utilization;
+    let core_width = (core_area / aspect_ratio).sqrt() as i32;
+    let core_height = (core_width as f64 * aspect_ratio).round() as i32;
+    Rect {
+        x_min: 0,
+        y_min: 0,
+        x_max: space_left + core_width + space_right,
+        y_max: space_bottom + core_height + space_top,
+    }
+}
+
+/// Upstream `InitFloorplan::makeRowsWithSpacing` — the core is the die inset by the spacings.
+///
+/// ⚠️ **Applied to the SNAPPED die**, which is why the core can differ by a grid step from the
+/// one [`die_from_utilization`] laid out.
+pub fn core_from_die_spacing(
+    die: Rect,
+    space_bottom: i32,
+    space_top: i32,
+    space_left: i32,
+    space_right: i32,
+) -> Rect {
+    Rect {
+        x_min: die.x_min + space_left,
+        y_min: die.y_min + space_bottom,
+        x_max: die.x_max - space_right,
+        y_max: die.y_max - space_top,
     }
 }
 
@@ -1433,6 +1534,70 @@ fn split_rows_for_one_domain(
     }
     in_place.extend(appended);
     in_place
+}
+
+#[cfg(test)]
+mod utilization_tests {
+    use super::*;
+
+    /// ⛔ The width TRUNCATES and the height ROUNDS, from the already-truncated width.
+    ///
+    /// Numbers are `init_floorplan2`'s, worked from its golden: 15.428 um² at 2000 DBU/um is
+    /// 61,712,000 DBU², 30% utilization and aspect 0.5.
+    #[test]
+    fn the_die_follows_upstreams_truncate_then_round() {
+        let die = die_from_utilization(61_712_000.0, 30.0, 0.5, 2000, 2000, 2000, 2000);
+        // core_area = 205706666.7; sqrt(core_area/0.5) = 20283.32 -> 20283 (TRUNCATED)
+        // round(20283 * 0.5) = round(10141.5) = 10142 (ROUNDED AWAY FROM ZERO)
+        assert_eq!(die, Rect { x_min: 0, y_min: 0, x_max: 24283, y_max: 14142 });
+        // On Nangate45's 10-DBU manufacturing grid this is the golden's 12.140 x 7.070 um.
+        assert_eq!(snap_to_mfg_grid(die.x_max, Some(10)), 24280);
+        assert_eq!(snap_to_mfg_grid(die.y_max, Some(10)), 14140);
+    }
+
+    /// The two roundings are genuinely different — a witness chosen so they disagree, since the
+    /// corpus's own cases wash the difference out in the grid snap.
+    #[test]
+    fn truncating_the_height_too_would_give_a_different_die() {
+        // aspect 0.5 and an odd core_width make `core_width * aspect` land exactly on .5.
+        let die = die_from_utilization(61_712_000.0, 30.0, 0.5, 0, 0, 0, 0);
+        assert_eq!(die.x_max, 20283, "width truncates");
+        assert_eq!(die.y_max, 10142, "height rounds UP from 10141.5, it does not truncate to 10141");
+    }
+
+    /// ⚠️ The die origin is always (0, 0); the spacings push the core in, not the die out.
+    #[test]
+    fn the_spacings_extend_the_die_but_never_move_its_origin() {
+        let die = die_from_utilization(61_712_000.0, 30.0, 0.5, 100, 200, 300, 400);
+        assert_eq!((die.x_min, die.y_min), (0, 0));
+        assert_eq!(die.x_max, 300 + 20283 + 400);
+        assert_eq!(die.y_max, 100 + 10142 + 200);
+    }
+
+    /// The core comes back off the die, so a snapped die gives a shifted core — upstream's own
+    /// two-step, and the reason the core is not simply what the die computation assumed.
+    #[test]
+    fn the_core_is_re_derived_from_the_snapped_die() {
+        let snapped = Rect { x_min: 0, y_min: 0, x_max: 24280, y_max: 14140 };
+        let core = core_from_die_spacing(snapped, 2000, 2000, 2000, 2000);
+        assert_eq!(core, Rect { x_min: 2000, y_min: 2000, x_max: 22280, y_max: 12140 });
+    }
+
+    /// ⚠️ Every instance counts, pads and covers included.
+    #[test]
+    fn the_design_area_counts_pads_and_covers_too() {
+        let inst = |w, h, pad, cover| Instance {
+            name: "i".into(),
+            width: w,
+            height: h,
+            is_pad: pad,
+            is_cover: cover,
+            symmetry_r90: false,
+        };
+        let a = design_area(&[inst(10, 20, false, false), inst(30, 40, true, false),
+                              inst(50, 60, false, true)]);
+        assert_eq!(a, 200.0 + 1200.0 + 3000.0);
+    }
 }
 
 #[cfg(test)]
