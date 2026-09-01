@@ -162,9 +162,23 @@ struct Cli {
     /// `-core_space` in MICRONS, as (bottom, top, left, right). One value on the command line
     /// fills all four, which is upstream's own shorthand.
     core_space: Option<[f64; 4]>,
+    /// The die and core outlines as given, in MICRONS. **More than four coordinates means a
+    /// POLYGON floorplan** — upstream tests exactly that and switches the whole command over.
+    die_pts: Vec<f64>,
+    core_pts: Vec<f64>,
 }
 
 /// `x1 y1 x2 y2`, whitespace- or comma-separated.
+/// Every coordinate in an area argument, in order. Four is a rectangle; more is a POLYGON, and
+/// upstream decides which form the whole command takes on exactly that count.
+fn parse_coords(s: &str) -> Option<Vec<f64>> {
+    s.split([' ', ',', '\t'])
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse::<f64>())
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
 fn parse_rect(s: &str) -> Option<[f64; 4]> {
     let n: Vec<f64> = s
         .split([' ', ',', '\t'])
@@ -202,6 +216,8 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         report: None,
         dry_run: false,
         gap_um: None,
+        die_pts: Vec::new(),
+        core_pts: Vec::new(),
         utilization: None,
         aspect_ratio: None,
         core_space: None,
@@ -220,17 +236,21 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         match a {
             "--die-area" => {
                 let v = value()?;
-                die = Some(
-                    parse_rect(&v)
-                        .ok_or_else(|| format!("--die-area wants 'x1 y1 x2 y2', got `{v}`"))?,
-                );
+                cli.die_pts = parse_coords(&v)
+                    .ok_or_else(|| format!("--die-area wants numbers, got `{v}`"))?;
+                die = parse_rect(&v);
+                if die.is_none() && cli.die_pts.len() <= 4 {
+                    return Err(format!("--die-area wants 'x1 y1 x2 y2', got `{v}`"));
+                }
             }
             "--core-area" => {
                 let v = value()?;
-                core = Some(
-                    parse_rect(&v)
-                        .ok_or_else(|| format!("--core-area wants 'x1 y1 x2 y2', got `{v}`"))?,
-                );
+                cli.core_pts = parse_coords(&v)
+                    .ok_or_else(|| format!("--core-area wants numbers, got `{v}`"))?;
+                core = parse_rect(&v);
+                if core.is_none() && cli.core_pts.len() <= 4 {
+                    return Err(format!("--core-area wants 'x1 y1 x2 y2', got `{v}`"));
+                }
             }
             "--site" => site = Some(value()?),
             "--additional-sites" => cli.additional = parse_list(&value()?),
@@ -312,8 +332,18 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         if cli.core_space.is_some() && die.is_some() {
             return Err("IFP-0024 -core_space cannot be used with -die_area.".to_string());
         }
-        cli.die = die.ok_or("`run` needs --die-area or --utilization")?;
-        cli.core = core.ok_or("`run` needs --core-area")?;
+        // ⛔ POLYGON MODE: upstream switches on the COORDINATE COUNT of either area, and then
+        // both must be polygons — `make_polygon_die_helper` requires `-die_area` (IFP-75) and
+        // `make_polygon_rows_helper` requires `-core_area` (IFP-85).
+        // ⛔ POLYGON MODE is decided here and VALIDATED IN `run_polygon`, not here. Upstream
+        // prints IFP-5 and IFP-106 before it ever looks at `-core_area`, so validating both
+        // outlines up front reports the right error at the wrong point in the sequence — which is
+        // exactly what `init_floorplan_polygon2`'s golden catches.
+        if cli.die_pts.len() > 4 || cli.core_pts.len() > 4 {
+        } else {
+            cli.die = die.ok_or("`run` needs --die-area or --utilization")?;
+            cli.core = core.ok_or("`run` needs --core-area")?;
+        }
     }
     Ok(cli)
 }
@@ -686,6 +716,258 @@ fn refuse(e: PlanError, dbu: f64) -> ExitCode {
     ExitCode::from(1)
 }
 
+/// `reportAreas` for the polygon path, read back from the database.
+///
+/// The rectangular path reports from the plan it just built; here the die is a polygon and the
+/// core is whatever the clipped rows cover, so both come from the database rather than from
+/// arithmetic. The lines and their formatting are the same — they are the same `reportAreas`.
+fn report_polygon_areas(db: &Db, dbu: f64, instances: &[Instance]) {
+    use vyges_events::{Event, Severity};
+    let um = |v: i32| (v as f64) / dbu;
+    let (dxa, dya, dxb, dyb) = (
+        db.block_get_die_area_x_min(), db.block_get_die_area_y_min(),
+        db.block_get_die_area_x_max(), db.block_get_die_area_y_max(),
+    );
+    let (cxa, cya, cxb, cyb) = (
+        db.block_get_core_area_x_min(), db.block_get_core_area_y_min(),
+        db.block_get_core_area_x_max(), db.block_get_core_area_y_max(),
+    );
+    let core_um2 = um(cxb - cxa) * um(cyb - cya);
+    let design_um2 = vyges_ifp::design_area(instances) / (dbu * dbu);
+
+    let mut census: Vec<(&str, String)> = vec![
+        ("IFP-CENSUS-DIE", format!(
+            "IFP-0100 Die BBox: ( {:.3} {:.3} ) ( {:.3} {:.3} ) um",
+            um(dxa), um(dya), um(dxb), um(dyb))),
+        ("IFP-CENSUS-CORE", format!(
+            "IFP-0101 Core BBox: ( {:.3} {:.3} ) ( {:.3} {:.3} ) um",
+            um(cxa), um(cya), um(cxb), um(cyb))),
+        ("IFP-CENSUS-AREA", format!("IFP-0102 Core area: {core_um2:.3} um^2")),
+        ("IFP-CENSUS-DESIGN-AREA",
+         format!("IFP-0103 Total instances area: {design_um2:.3} um^2")),
+    ];
+    if core_um2 > 0.0 {
+        census.push(("IFP-CENSUS-UTIL",
+            format!("IFP-0104 Effective utilization: {:.3}", design_um2 / core_um2)));
+    }
+    census.push(("IFP-CENSUS-INSTS",
+        format!("IFP-0105 Number of instances: {}", db.num_insts())));
+    for (code, text) in census {
+        vyges_events::emit(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
+    }
+}
+
+/// The polygon form of `initialize_floorplan` — upstream's `makePolygonDie` + `makePolygonRows`.
+///
+/// 🔑 **The call sequence, which is what makes this a separate function rather than a flag**
+/// (`InitFloorplan.cc:212` and `:266`, reached through the Tcl's `make_polygon_die_helper` and
+/// `make_polygon_rows_helper`):
+///
+/// ```text
+/// IFP-5    "Added N die polygon vertices to the list."    (the Tcl, before anything)
+/// makePolygonDie:   IFP-106, >=4 vertices, snap EVERY vertex to the mfg grid, store, resetTracks
+/// makePolygonRows:  >=4 core vertices, snap them too, die must contain the core BBOX (IFP-1004),
+///                   checkInstanceDimensions against that BBOX, clear rows
+/// makePolygonRowsScanline: refuse a hybrid base site (IFP-1000); snap the bbox lower left UP to
+///                   the site grid (IFP-1003 if it moved); per site in NAME order, height-multiple
+///                   check (IFP-1001) then rows clipped to the polygon (IFP-1002 each);
+///                   updateVoltageDomain, then cutRows
+/// IFP-997  "Completed polygon-aware row generation using N vertices"   (N = points - 1)
+/// reportAreas
+/// ```
+///
+/// ⚠️ **`points.size() - 1`**: odb closes the ring, so an 8-vertex input reads back as 9 points
+/// and the line prints 8.
+#[allow(clippy::too_many_arguments)]
+fn run_polygon(
+    db: &mut Db,
+    cli: &Cli,
+    _dbu: i32,
+    dbu_f: f64,
+    grid: Option<i32>,
+    gap: Option<i32>,
+    sites: &[Site],
+    instances: &[Instance],
+) -> ExitCode {
+    use vyges_events::{Event, Severity};
+    let um = |v: i32| (v as f64) / dbu_f;
+    // Microns -> DBU, then every vertex snapped to the manufacturing grid, which both
+    // `makePolygonDie` and `makePolygonRows` do to their own point lists.
+    let to_poly = |pts: &[f64]| -> Vec<(i32, i32)> {
+        pts.chunks(2)
+            .map(|c| {
+                (
+                    vyges_ifp::snap_to_mfg_grid(to_dbu(c[0], dbu_f), grid),
+                    vyges_ifp::snap_to_mfg_grid(to_dbu(c[1], dbu_f), grid),
+                )
+            })
+            .collect()
+    };
+    let fail = |code: &str, text: String| -> ExitCode {
+        vyges_events::emit(&Event::new("vyges-ifp", Severity::Error, text).with_code(code));
+        ExitCode::from(1)
+    };
+
+    // ⛔ **Upstream's order, and it is observable.** `make_polygon_die_helper` validates the DIE
+    // and prints IFP-5, `makePolygonDie` prints IFP-106 — and only THEN does
+    // `make_polygon_rows_helper` look at `-core_area`. A case with a good die and no core sees
+    // IFP-5 and IFP-106 before its IFP-85; a case with a malformed die sees neither.
+    if cli.die_pts.is_empty() {
+        return fail("IFP-NO-DIE-POLYGON",
+                    "IFP-0075 no -die_area specified for polygon floorplan.".to_string());
+    }
+    if cli.die_pts.len() % 2 != 0 {
+        return fail("IFP-DIE-POLYGON-ODD",
+            "IFP-0076 -die_area must have an even number of coordinates (x y pairs).".to_string());
+    }
+    if cli.die_pts.len() < 8 {
+        return fail("IFP-DIE-POLYGON-SHORT",
+            "IFP-0077 -die_area must have at least 4 vertices (8 coordinates).".to_string());
+    }
+
+    let die_poly = to_poly(&cli.die_pts);
+    vyges_events::emit(&Event::new(
+        "vyges-ifp",
+        Severity::Info,
+        format!("IFP-0005 Added {} die polygon vertices to the list.", die_poly.len()),
+    ).with_code("IFP-DIE-POLYGON-VERTICES"));
+    vyges_events::emit(&Event::new(
+        "vyges-ifp",
+        Severity::Info,
+        "IFP-0106 Initializing floorplan in polygon mode.".to_string(),
+    ).with_code("IFP-POLYGON-MODE"));
+
+    if cli.core_pts.is_empty() {
+        return fail("IFP-NO-CORE-POLYGON",
+                    "IFP-0085 no -core_area specified for polygonal floorplan.".to_string());
+    }
+    if cli.core_pts.len() % 2 != 0 {
+        return fail("IFP-CORE-POLYGON-ODD",
+            "IFP-0082 -core_area must have an even number of coordinates (x y pairs).".to_string());
+    }
+    if cli.core_pts.len() < 8 {
+        return fail("IFP-CORE-POLYGON-SHORT",
+            "IFP-0083 -core_area must have at least 4 vertices (8 coordinates).".to_string());
+    }
+    let core_poly = to_poly(&cli.core_pts);
+
+    let die_bbox = vyges_ifp::polygon_bbox(&die_poly);
+    let core_bbox = vyges_ifp::polygon_bbox(&core_poly);
+    if !die_bbox.contains(&core_bbox) {
+        eprintln!("vyges-ifp: IFP-1004 Die area must contain the core polygon bounding box.");
+        return ExitCode::from(1);
+    }
+    if let Err(e) = vyges_ifp::check_instance_dimensions(instances, core_bbox) {
+        return refuse(e, dbu_f);
+    }
+
+    let Some(base) = sites.first() else {
+        eprintln!("vyges-ifp: no site to build rows from");
+        return ExitCode::from(1);
+    };
+    if base.is_hybrid() {
+        eprintln!("vyges-ifp: IFP-1000 Hybrid rows not yet supported with polygon-aware \
+                   generation.");
+        return ExitCode::from(1);
+    }
+
+    // Sites in NAME order, deduplicated — the same `std::map` ordering the rectangular path uses.
+    let mut ordered: Vec<&Site> = sites.iter().collect();
+    ordered.sort_by(|a, b| a.name.cmp(&b.name));
+    ordered.dedup_by(|a, b| a.name == b.name);
+
+    let mut rows: Vec<vyges_ifp::Row> = Vec::new();
+    let mut per_site: Vec<(String, usize)> = Vec::new();
+    let mut snapped_bbox = core_bbox;
+
+    // ⚠️ The whole row-building step is inside upstream's non-negative guard; a core whose lower
+    // left is negative produces NO rows and still reaches the blockage cutting below.
+    if core_bbox.x_min >= 0 && core_bbox.y_min >= 0 {
+        let clx = vyges_ifp::div_ceil(core_bbox.x_min, base.width) * base.width;
+        let cly = vyges_ifp::div_ceil(core_bbox.y_min, base.height) * base.height;
+        if clx != core_bbox.x_min || cly != core_bbox.y_min {
+            vyges_events::emit(&Event::new(
+                "vyges-ifp",
+                Severity::Warn,
+                format!(
+                    "IFP-1003 Core polygon bounding box lower left ({:.3}, {:.3}) snapped to \
+                     ({:.3}, {:.3}).",
+                    um(core_bbox.x_min), um(core_bbox.y_min), um(clx), um(cly)
+                ),
+            ).with_code("IFP-POLYGON-BBOX-SNAPPED"));
+        }
+        snapped_bbox = Rect::new(clx, cly, core_bbox.x_max, core_bbox.y_max);
+
+        for site in &ordered {
+            if site.height % base.height != 0 {
+                eprintln!(
+                    "vyges-ifp: IFP-1001 Site {} height {:.3}um is not a multiple of site {} \
+                     height {:.3}um.",
+                    site.name, um(site.height), base.name, um(base.height)
+                );
+                return ExitCode::from(1);
+            }
+            let flipped = cli.flipped.iter().any(|f| f == &site.name);
+            let made = vyges_ifp::polygon_rows(
+                site, &core_poly, snapped_bbox, cli.parity, flipped, rows.len(),
+            );
+            per_site.push((site.name.clone(), made.len()));
+            rows.extend(made);
+        }
+    }
+
+    // Write: the polygon die, then the rows, then the core area the rows cover.
+    let flat: Vec<i32> = die_poly.iter().flat_map(|p| [p.0, p.1]).collect();
+    if let Err(e) = db.set_die_area_polygon(&flat) {
+        eprintln!("vyges-ifp: cannot set the polygon die area: {e}");
+        return ExitCode::from(2);
+    }
+    if let Err(e) = db.clear_rows() {
+        eprintln!("vyges-ifp: cannot clear the existing rows: {e}");
+        return ExitCode::from(2);
+    }
+    for r in &rows {
+        if let Err(e) = db.create_row(&r.name, &r.site, r.x, r.y, &r.orient, "HORIZONTAL",
+                                      r.num_sites, r.spacing) {
+            eprintln!("vyges-ifp: cannot create {}: {e}", r.name);
+            return ExitCode::from(2);
+        }
+    }
+    for (site, n) in &per_site {
+        vyges_events::emit(&Event::new(
+            "vyges-ifp",
+            Severity::Info,
+            format!("IFP-1002 Added {n} polygon-aware rows for site {site}."),
+        ).with_code("IFP-POLYGON-ROWS").with_objects(vec![format!("site:{site}")]));
+    }
+    if let Err(e) = db.set_core_area_from_rows() {
+        eprintln!("vyges-ifp: cannot set the core area: {e}");
+        return ExitCode::from(2);
+    }
+    let _ = gap;   // the polygon path reaches updateVoltageDomain, which is not built here yet
+    if let Err(e) = db.cut_rows_at_blockages(0, 0, 0, 0) {
+        eprintln!("vyges-ifp: cannot cut the rows around the blockages: {e}");
+        return ExitCode::from(2);
+    }
+
+    vyges_events::emit(&Event::new(
+        "vyges-ifp",
+        Severity::Info,
+        // ⚠️ odb closes the ring, so its point count is one more than the vertices given.
+        format!("IFP-0997 Completed polygon-aware row generation using {} vertices",
+                core_poly.len()),
+    ).with_code("IFP-POLYGON-COMPLETE"));
+
+    report_polygon_areas(db, dbu_f, instances);
+
+    let dest = cli.out_odb.clone().unwrap_or_else(|| cli.odb.clone());
+    if let Err(e) = db.write(&dest) {
+        eprintln!("vyges-ifp: cannot write {dest}: {e}");
+        return ExitCode::from(2);
+    }
+    ExitCode::SUCCESS
+}
+
 fn run(args: &[String]) -> ExitCode {
     let cli = match parse_args(args) {
         Ok(c) => c,
@@ -797,6 +1079,32 @@ fn run(args: &[String]) -> ExitCode {
         }
     };
 
+    // ⛔ **`checkGap` is the FIRST thing `initFloorplan` does**, and `makeRows` and
+    // `makeRowsWithSpacing` each repeat it before touching the database. A gap is rejected whether
+    // or not the design has a voltage domain to use it on — validating it only where it is
+    // consumed means a design with no domains accepts a gap upstream refuses.
+    //
+    // ⚠️ `None` is upstream's INT32_MIN sentinel for "not given"; the margin then falls back to
+    // 6 x the minimum site height rather than to a number the caller never chose.
+    let gap = match cli.gap_um {
+        None => None,
+        Some(um) => {
+            let g = vyges_ifp::microns_to_mfg_grid(um, dbu, grid.unwrap_or(0));
+            if g <= 0 {
+                vyges_events::emit(
+                    &vyges_events::Event::new(
+                        "vyges-ifp",
+                        vyges_events::Severity::Error,
+                        format!("IFP-0036 Gap must be positive ({g})"),
+                    )
+                    .with_code("IFP-BAD-GAP"),
+                );
+                return ExitCode::from(1);
+            }
+            Some(g)
+        }
+    };
+
     let rect = |v: [f64; 4]| {
         Rect::new(
             to_dbu(v[0], dbu_f),
@@ -828,6 +1136,14 @@ fn run(args: &[String]) -> ExitCode {
     // re-derives the core from that die minus the same spacings. The die is snapped to the
     // manufacturing grid in between, so the core is NOT the rectangle the die computation laid
     // out — reproducing that two-step is the whole point.
+    // ⛔ **POLYGON MODE takes the whole command down a different path**, and it is NOT `makeRows`:
+    // `make_polygon_die_helper` + `make_polygon_rows_helper` in the Tcl, then `makePolygonDie` and
+    // `makePolygonRows` in C++, with their own message ids (IFP-1003 where the rectangular path
+    // warns IFP-0028, IFP-1001 where it errors IFP-0054). Hybrid sites are refused outright.
+    if !cli.die_pts.is_empty() && (cli.die_pts.len() > 4 || cli.core_pts.len() > 4) {
+        return run_polygon(&mut db, &cli, dbu, dbu_f, grid, gap, &sites, &instances);
+    }
+
     let (die_in, core_in) = match cli.utilization {
         None => (rect(cli.die), rect(cli.core)),
         Some(util) => {
@@ -899,20 +1215,6 @@ fn run(args: &[String]) -> ExitCode {
     let mut split_rows: Option<Vec<vyges_ifp::Row>> = None;
     let domains = voltage_domains(&db);
     if !domains.is_empty() {
-        // ⚠️ IFP-36: any gap that is given must be positive. Upstream's sentinel for "not given"
-        // is INT32_MIN, and `None` is ours -- the margin then falls back to 6 x the minimum site
-        // height rather than to a number the caller never chose.
-        let gap = match cli.gap_um {
-            None => None,
-            Some(um) => {
-                let g = vyges_ifp::microns_to_mfg_grid(um, dbu, grid.unwrap_or(0));
-                if g <= 0 {
-                    eprintln!("vyges-ifp: IFP-0036 Gap must be positive ({g})");
-                    return ExitCode::from(1);
-                }
-                Some(g)
-            }
-        };
         let heights: std::collections::HashMap<String, i32> =
             sites.iter().map(|s| (s.name.clone(), s.height)).collect();
         let pads: std::collections::HashSet<String> = sites

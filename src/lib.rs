@@ -317,8 +317,11 @@ pub fn snap_to_mfg_grid(coord: i32, grid: Option<i32>) -> i32 {
     }
 }
 
-/// `ceil(a / b)` for positive `b`, on integers.
-fn div_ceil(a: i32, b: i32) -> i32 {
+/// `ceil(a / b)` for positive `b`, on integers — upstream's file-static `divCeil`.
+///
+/// Public because the POLYGON path snaps its bounding box with the same rule, from the
+/// binary rather than from `plan()`.
+pub fn div_ceil(a: i32, b: i32) -> i32 {
     debug_assert!(b > 0);
     if a >= 0 {
         (a + b - 1) / b
@@ -1293,6 +1296,156 @@ mod tests {
     }
 }
 
+// ------------------------------------------------------- polygon floorplans
+
+/// Upstream `InitFloorplan::intersectRowWithPolygon` — the horizontal spans of one row that lie
+/// inside a polygon.
+///
+/// 🔑 **The whole rule, transcribed** (`ifp/src/InitFloorplan.cc:1238`):
+///
+/// ```text
+/// scanline at row.yMin()                       // the row's BOTTOM edge, not its middle
+/// for each edge (cyclic, p[i] -> p[(i+1) % n]):
+///     skip it when y1 == y2                    // horizontal edges contribute nothing
+///     crossing when (y1 <= ry && y2 > ry) || (y1 > ry && y2 <= ry)
+///     x = round(x1 + (double)(x2 - x1) * (ry - y1) / (y2 - y1))
+/// sort the crossings; take them in PAIRS (even-odd rule)
+/// clip each pair to the row, and keep it only if it is still non-empty
+/// ```
+///
+/// ⚠️ **The crossing test is half-open on purpose.** A vertex exactly on the scanline is counted
+/// by one of its two edges and not the other, so a shape that comes to a point on the scanline
+/// does not produce a doubled crossing and invert the inside/outside parity for the rest of the row.
+///
+/// ⚠️ **The interpolation is `double` and ROUNDS**, then narrows to `int`. Doing it in integers
+/// would truncate and pull every sloped edge left by up to a DBU.
+pub fn intersect_row_with_polygon(row: Rect, polygon: &[(i32, i32)]) -> Vec<Rect> {
+    let row_y = row.y_min;
+    let row_height = row.dy();
+    let n = polygon.len();
+    let mut crossings: Vec<i32> = Vec::new();
+
+    for i in 0..n {
+        let (x1, y1) = polygon[i];
+        let (x2, y2) = polygon[(i + 1) % n];
+        if y1 == y2 {
+            continue;
+        }
+        let crosses = (y1 <= row_y && y2 > row_y) || (y1 > row_y && y2 <= row_y);
+        if !crosses {
+            continue;
+        }
+        let x = x1 as f64
+            + (x2 - x1) as f64 * (row_y - y1) as f64 / (y2 - y1) as f64;
+        crossings.push(x.round() as i32);
+    }
+    crossings.sort_unstable();
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < crossings.len() {
+        let (x_start, x_end) = (crossings[i], crossings[i + 1]);
+        if x_end > x_start {
+            let a = x_start.max(row.x_min);
+            let b = x_end.min(row.x_max);
+            if b > a {
+                out.push(Rect { x_min: a, y_min: row_y, x_max: b, y_max: row_y + row_height });
+            }
+        }
+        i += 2;
+    }
+    out
+}
+
+/// Upstream `InitFloorplan::makeUniformRowsPolygon` — one site's rows, clipped to the polygon.
+///
+/// 🔑 **The whole rule** (`ifp/src/InitFloorplan.cc:1298`):
+///
+/// ```text
+/// total_rows = applyRowParity(core_bbox.dy() / site_dy, parity)   // the BBOX's height
+/// for row_idx in 0..total_rows:
+///     segments = intersectRowWithPolygon(bbox-wide row at y, polygon)
+///     for each segment:
+///         sites = segment.dx() / site_dx;  skip if 0
+///         snapped_left = (segment.xMin() / site_dx) * site_dx     // integer floor
+///         if snapped_left < segment.xMin():
+///             snapped_left += site_dx
+///             sites = (segment.dx() - (snapped_left - segment.xMin())) / site_dx
+///         if sites > 0: create a row, orientation from (row_idx + flip) % 2
+///     y += site_dy
+/// ```
+///
+/// ⚠️ **The row count comes from the BOUNDING BOX**, not from the polygon — a row index exists for
+/// every band of the bbox, and bands that miss the polygon simply produce no segments.
+///
+/// ⚠️ **The orientation alternates on `row_idx`, not on how many rows were created.** A band that
+/// produced nothing still advances the phase, so a concave polygon does not flip the stripe
+/// pattern of everything above it.
+///
+/// `first_index` is where global row numbering continues from — upstream names each row from
+/// `block_->getRows().size()` at creation time.
+pub fn polygon_rows(
+    site: &Site,
+    polygon: &[(i32, i32)],
+    core_bbox: Rect,
+    parity: RowParity,
+    flipped: bool,
+    first_index: usize,
+) -> Vec<Row> {
+    let mut out = Vec::new();
+    if site.width <= 0 || site.height <= 0 {
+        return out;
+    }
+    let total_rows = apply_row_parity(core_bbox.dy() / site.height, parity);
+    let flip = i32::from(flipped);
+    let mut y = core_bbox.y_min;
+
+    for row_idx in 0..total_rows {
+        let band = Rect {
+            x_min: core_bbox.x_min,
+            y_min: y,
+            x_max: core_bbox.x_max,
+            y_max: y + site.height,
+        };
+        for seg in intersect_row_with_polygon(band, polygon) {
+            let seg_width = seg.dx();
+            let seg_left = seg.x_min;
+            let mut sites = seg_width / site.width;
+            if sites <= 0 {
+                continue;
+            }
+            let mut snapped_left = (seg_left / site.width) * site.width;
+            if snapped_left < seg_left {
+                snapped_left += site.width;
+                sites = (seg_width - (snapped_left - seg_left)) / site.width;
+            }
+            if sites > 0 {
+                out.push(Row {
+                    name: format!("ROW_{}", first_index + out.len()),
+                    site: site.name.clone(),
+                    x: snapped_left,
+                    y,
+                    orient: if (row_idx + flip) % 2 == 0 { "R0" } else { "MX" }.to_string(),
+                    num_sites: sites,
+                    spacing: site.width,
+                });
+            }
+        }
+        y += site.height;
+    }
+    out
+}
+
+/// The bounding box of a polygon's vertices.
+pub fn polygon_bbox(polygon: &[(i32, i32)]) -> Rect {
+    Rect {
+        x_min: polygon.iter().map(|p| p.0).min().unwrap_or(0),
+        y_min: polygon.iter().map(|p| p.1).min().unwrap_or(0),
+        x_max: polygon.iter().map(|p| p.0).max().unwrap_or(0),
+        y_max: polygon.iter().map(|p| p.1).max().unwrap_or(0),
+    }
+}
+
 // --------------------------------------------------------------- utilization
 
 /// Upstream `InitFloorplan::makeDieUtilization` — derive the DIE from the placed cell area.
@@ -1534,6 +1687,98 @@ fn split_rows_for_one_domain(
     }
     in_place.extend(appended);
     in_place
+}
+
+#[cfg(test)]
+mod polygon_tests {
+    use super::*;
+
+    /// An L, counter-clockwise: wide at the bottom, narrow on the left above the notch.
+    fn ell() -> Vec<(i32, i32)> {
+        vec![(0, 0), (1000, 0), (1000, 400), (400, 400), (400, 1000), (0, 1000)]
+    }
+
+    #[test]
+    fn a_scanline_below_the_notch_spans_the_whole_shape() {
+        let row = Rect { x_min: 0, y_min: 0, x_max: 1000, y_max: 100 };
+        assert_eq!(
+            intersect_row_with_polygon(row, &ell()),
+            vec![Rect { x_min: 0, y_min: 0, x_max: 1000, y_max: 100 }]
+        );
+    }
+
+    #[test]
+    fn a_scanline_above_the_notch_stops_at_the_step() {
+        let row = Rect { x_min: 0, y_min: 600, x_max: 1000, y_max: 700 };
+        assert_eq!(
+            intersect_row_with_polygon(row, &ell()),
+            vec![Rect { x_min: 0, y_min: 600, x_max: 400, y_max: 700 }],
+            "above the notch the shape is only 400 wide"
+        );
+    }
+
+    /// ⚠️ The band is clipped to the ROW, so a polygon wider than the band still yields the band.
+    #[test]
+    fn segments_are_clipped_to_the_row_they_came_from() {
+        let row = Rect { x_min: 200, y_min: 0, x_max: 600, y_max: 100 };
+        assert_eq!(
+            intersect_row_with_polygon(row, &ell()),
+            vec![Rect { x_min: 200, y_min: 0, x_max: 600, y_max: 100 }]
+        );
+    }
+
+    /// ⛔ A shape that comes to a point ON the scanline must not double-count the vertex. The
+    /// half-open crossing test is what prevents the parity inverting for the rest of the row.
+    #[test]
+    fn a_vertex_exactly_on_the_scanline_is_counted_once() {
+        // A diamond whose left and right corners sit at y = 500.
+        let diamond = vec![(500, 0), (1000, 500), (500, 1000), (0, 500)];
+        let row = Rect { x_min: 0, y_min: 500, x_max: 1000, y_max: 600 };
+        let got = intersect_row_with_polygon(row, &diamond);
+        assert_eq!(got.len(), 1, "one span, not two or zero: {got:?}");
+        assert_eq!((got[0].x_min, got[0].x_max), (0, 1000));
+    }
+
+    /// ⚠️ A sloped edge interpolates in `double` and ROUNDS.
+    #[test]
+    fn a_sloped_edge_rounds_rather_than_truncating() {
+        // Edge from (0,0) to (3,10): at y = 1 the exact x is 0.3 -> 0; at y = 5 it is 1.5 -> 2.
+        let tri = vec![(0, 0), (3, 10), (1000, 10), (1000, 0)];
+        let at = |y| intersect_row_with_polygon(
+            Rect { x_min: -10, y_min: y, x_max: 1000, y_max: y + 1 }, &tri)[0].x_min;
+        assert_eq!(at(1), 0, "0.3 rounds to 0");
+        assert_eq!(at(5), 2, "1.5 rounds AWAY from zero to 2, it does not truncate to 1");
+    }
+
+    /// The row count comes from the bounding box, and a band that misses the shape makes nothing —
+    /// but it still advances the orientation phase.
+    #[test]
+    fn bands_that_miss_the_polygon_still_advance_the_orientation() {
+        // Two separate blocks stacked with a gap: y 0..200 and y 400..600, 1000 wide.
+        let two = vec![(0, 0), (1000, 0), (1000, 200), (0, 200)];
+        let site = Site::plain("s", 100, 200);
+        let bbox = Rect { x_min: 0, y_min: 0, x_max: 1000, y_max: 600 };
+        let rows = polygon_rows(&site, &two, bbox, RowParity::None, false, 0);
+        assert_eq!(rows.len(), 1, "only the band inside the shape makes a row");
+        assert_eq!(rows[0].orient, "R0");
+        assert_eq!(rows[0].num_sites, 10);
+        assert_eq!(rows[0].name, "ROW_0", "numbering starts where it was told to");
+    }
+
+    /// The left edge of a segment is snapped UP to the site grid, and the site count follows the
+    /// shift rather than the original width.
+    #[test]
+    fn a_segment_starting_off_grid_is_snapped_up_and_loses_the_partial_site() {
+        // A shape starting at x = 150 on a 100-wide site: the row starts at 200, not 150.
+        let shape = vec![(150, 0), (1000, 0), (1000, 200), (150, 200)];
+        let site = Site::plain("s", 100, 200);
+        let bbox = Rect { x_min: 150, y_min: 0, x_max: 1000, y_max: 200 };
+        let rows = polygon_rows(&site, &shape, bbox, RowParity::None, false, 0);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].x, 200, "snapped up from 150");
+        // width 850, shifted by 50 -> 800 / 100 = 8
+        assert_eq!(rows[0].num_sites, 8);
+    }
 }
 
 #[cfg(test)]
