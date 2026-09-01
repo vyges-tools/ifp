@@ -1362,6 +1362,55 @@ pub fn track_patterns(
     Ok((px, py))
 }
 
+/// Upstream `InitFloorplan::makeTracksNonUniform` — the SEQUENCE of ordinary `makeTracks` calls a
+/// layer carrying `LEF58_PITCH` (`FIRSTLASTPITCH`) expands into. Returns each call's `y_offset`.
+///
+/// 🔑 **The whole rule, transcribed** (`ifp/src/InitFloorplan.cc:1122`):
+///
+/// ```text
+/// cell_row_height = the height of the FIRST row whose site class is CORE    // IFP-45 if none
+/// y_track_count   = (cell_row_height - 2*first_last_pitch) / y_pitch + 1
+/// origin_y        = die_y_min + first_last_pitch
+/// repeat y_track_count times:
+///     makeTracks(layer, x_offset, x_pitch, origin_y, cell_row_height)
+///     origin_y += y_pitch
+/// origin_y += first_last_pitch - y_pitch
+/// makeTracks(layer, x_offset, x_pitch, origin_y, cell_row_height)           // one MORE, always
+/// ```
+///
+/// ⚠️ **Every call passes `cell_row_height` as the y PITCH**, not `y_pitch`. The row height is what
+/// the pattern repeats on; `y_pitch` only spaces the origins *within* one row. Reading `y_pitch` as
+/// the pattern step produces one grid at the wrong spacing instead of a stack of them.
+///
+/// ⚠️ **The layer's own `y_offset` is passed to the reference and never read.** Its body derives
+/// every origin from `first_last_pitch`, so the parameter is dead — do not "restore" it.
+///
+/// ⚠️ **The final call is unconditional**, so the layer gets `y_track_count + 1` patterns on each
+/// axis, and the x pattern is therefore added **identically that many times**. `y_track_count` can
+/// be zero or negative when `first_last_pitch` is large, leaving only that final call. Reproduced
+/// without a guard, because upstream has none.
+///
+/// Measured 2026-09-01 on ASAP7 (`make_tracks7`): `cell_row_height` 270, `y_pitch` 36,
+/// `first_last_pitch` 45 gives origins **45, 81, 117, 153, 189, 225, 270** — the reference's own
+/// seven `TRACKS Y … STEP 270` lines, the last with one fewer track because it starts higher.
+pub fn non_uniform_track_origins(
+    die_y_min: i32,
+    cell_row_height: i32,
+    y_pitch: i32,
+    first_last_pitch: i32,
+) -> Vec<i32> {
+    let y_track_count = (cell_row_height - 2 * first_last_pitch) / y_pitch + 1;
+    let mut origin_y = die_y_min + first_last_pitch;
+    let mut out = Vec::new();
+    for _ in 0..y_track_count {
+        out.push(origin_y);
+        origin_y += y_pitch;
+    }
+    origin_y += first_last_pitch - y_pitch;
+    out.push(origin_y);
+    out
+}
+
 /// Upstream `ifp::microns_to_mfg_grid` (`InitFloorplan.tcl:295`).
 ///
 /// 🔑 **Double rounding, and it is not decoration**: `round(round(um * dbu / grid) * grid)`. The
@@ -1429,6 +1478,30 @@ mod make_tracks_tests {
                 track_pattern(0, 1000, 100, 100, 0).unwrap()
             ))
         );
+    }
+
+    /// ⛔ A layer carrying `LEF58_PITCH` is a STACK of patterns, one per track within the cell row,
+    /// each repeating on the ROW HEIGHT — not one grid at the layer's own pitch.
+    ///
+    /// ASAP7's M2 (`PITCH 0.036 FIRSTLASTPITCH 0.045`, 1000 DBU/um, 270-DBU core row) is the
+    /// reference's own witness, and `make_tracks7` is the case that carries it.
+    #[test]
+    fn a_first_last_pitch_layer_expands_into_a_stack_of_row_height_patterns() {
+        assert_eq!(
+            non_uniform_track_origins(0, 270, 36, 45),
+            vec![45, 81, 117, 153, 189, 225, 270],
+            "six inside the row, then one more from first_last_pitch - y_pitch"
+        );
+        // 261 + 45 - 36 = 270: the tail is NOT another y_pitch step.
+        assert_eq!(*non_uniform_track_origins(0, 270, 36, 45).last().unwrap(), 270);
+
+        // The die origin is carried into every call, exactly as `die_area.yMin() +` does.
+        assert_eq!(non_uniform_track_origins(1000, 270, 36, 45)[0], 1045);
+
+        // ⚠️ first_last_pitch large enough to make the count non-positive leaves ONLY the final
+        // call — upstream has no guard, so neither do we. (100 - 2*70) / 36 = -40/36 = -1
+        // TRUNCATING TOWARD ZERO, as C++ does since C++11, so the count is 0 rather than -1+1.
+        assert_eq!(non_uniform_track_origins(0, 100, 36, 70), vec![104]);
     }
 
     /// The first-track guard moves the origin AND drops a track.

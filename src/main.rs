@@ -91,9 +91,11 @@ const DESCRIBE: &str = r#"{
       "MEASURED against that suite at the same pinned commit, re-run 2026-09-01: 23 cases reproduce every compared IFP-* line exactly, 0 fail, and 17 are not comparable (6 utilization form, 6 polygon floorplans, 3 that never call initialize_floorplan, 2 that need UPF). That number is about initialize_floorplan ALONE -- make-tracks, the engine's other command, is exercised by no case in that suite, so its correlation rests on unit tests rather than on the goldens.",
       "HYBRID SITES are supported: a site with a row pattern tiles the core from that pattern (IFP-0049) and every hybrid site additionally gets rows spanning a whole pattern each (IFP-0050), offset to where its pattern occurs in the base pattern -- matching as written (R0) or reversed with orientations mirrored (MX). Row parity is REFUSED on a hybrid floorplan (IFP-0051), because parity would have to trim whole patterns rather than rows.",
       "Sites are visited in NAME order and deduplicated by name, not in the order given on the command line -- row numbering and log order both follow from this. The site set also includes sites used by placed instances that were never named as arguments (upstream addUsedSites), excluding blocks.",
-      "Known gap (1 remaining) -- UPF POWER DOMAINS. Upstream's floorplan inserts power-domain instances and its instance census rises accordingly (16 to 40 on upf_test); this engine inserts none. All floorplan GEOMETRY matches exactly on those cases; what differs is the instance census that follows from the count -- IFP-0103, IFP-0104 and IFP-0105 together.",
+      "SCOPE -- upstream ifp exposes FOUR commands and this engine implements TWO. initialize_floorplan is `run` and make_tracks is `make-tracks`; make_rows and insert_tiecells are NOT implemented. The row-building algorithm itself exists inside `run`, so what make_rows lacks is an entry point that builds rows on a die already set; insert_tiecells is absent entirely.",
+      "Known gap -- UPF POWER DOMAINS. Upstream's floorplan inserts power-domain instances and its instance census rises accordingly (16 to 40 on upf_test); this engine inserts none. All floorplan GEOMETRY matches exactly on those cases; what differs is the instance census that follows from the count -- IFP-0103, IFP-0104 and IFP-0105 together.",
       "A macro larger than the core area is refused with IFP-0002 before anything is snapped or written, matching upstream's ordering: the die checks come first, so a design with both an empty die and an oversized macro reports the die. Pads and covers are exempt, and a master with R90 symmetry is measured against the core's larger dimension because it is free to rotate.",
       "The instance census (IFP-0103 total instance area, IFP-0104 effective utilization) counts EVERY instance's master area, including the pads and covers the fit check skips -- it is a census of the design, not a question about the core. Utilization is omitted rather than printed as infinity when the core area is zero.",
+      "make-tracks covers BOTH pitch forms. A layer whose technology carries LEF58_PITCH (FIRSTLASTPITCH) is not one grid at the layer pitch: it expands into a stack of patterns, one per track within the cell row, each repeating on the CORE ROW HEIGHT, with one further pattern past the end. A layer whose x or y offset runs past the die is skipped ENTIRELY -- both axes, not just the one that overran.",
       "The default output is IN PLACE, over the input database. Pass --out-odb to write elsewhere, or --dry-run to plan without writing."
   ],
   "invocation": {
@@ -785,7 +787,19 @@ fn make_tracks(args: &[String]) -> ExitCode {
             work.push((layer.clone(), g(v[0]), g(v[1]), g(v[2]), g(v[3])));
         }
     } else {
-        for (name, _dir) in db.layers_with_direction().unwrap_or_default() {
+        // ⛔ **The first CORE row's site height, in block row order** — upstream's
+        // `makeTracksNonUniform` takes the FIRST match and breaks, so a design whose rows mix site
+        // classes depends on which comes first. Computed once: it is a property of the block, and
+        // every non-uniform layer reads the same value.
+        let core_row_height = db.block_get_rows().into_iter().find_map(|row| {
+            let site = db.row_get_site(&row);
+            match db.site_get_class(&site).unwrap_or_default().as_str() {
+                "CORE" => Some(db.site_get_height(&site)),
+                _ => None,
+            }
+        });
+
+        for (name, dir) in db.layers_with_direction().unwrap_or_default() {
             // Upstream's filter, both halves: ROUTING type AND a non-zero routing level.
             if db.layer_get_type(&name).unwrap_or_default() != "ROUTING"
                 || db.layer_get_routing_level(&name) == 0
@@ -793,6 +807,41 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 continue;
             }
             let (xp, yp) = (db.layer_get_pitch_x(&name), db.layer_get_pitch_y(&name));
+
+            // ⛔ **LEF58_PITCH is tested BEFORE the zero-pitch warning**, and it wins: a layer
+            // carrying FIRSTLASTPITCH never reaches the ordinary path. Upstream's order, and it
+            // matters -- the non-uniform routine has no pitch guard of its own.
+            let first_last_pitch = db.layer_get_first_last_pitch(&name);
+            if first_last_pitch > 0 {
+                if dir != "HORIZONTAL" {
+                    eprintln!("vyges-ifp make-tracks: IFP-0044 Non horizontal layer {name} uses \
+                               property LEF58_PITCH.");
+                    return ExitCode::from(1);
+                }
+                let Some(row_h) = core_row_height else {
+                    eprintln!("vyges-ifp make-tracks: IFP-0045 No routing Row found in layer \
+                               {name}");
+                    return ExitCode::from(1);
+                };
+                // ⚠️ Ours, not upstream's: its `(row_h - 2*flp) / y_pitch` would divide by zero
+                // here. A tool must not fault on a technology file, so this is refused with a
+                // reason -- recorded in the divergence register rather than left to trap.
+                if yp == 0 {
+                    eprintln!("vyges-ifp make-tracks: layer {name} carries LEF58_PITCH but no \
+                               y pitch to space its tracks by.");
+                    return ExitCode::from(1);
+                }
+                // Each origin is one ordinary `makeTracks` call, and every one of them passes the
+                // ROW HEIGHT as the y pitch -- so the x pattern is added identically once per
+                // origin, which is upstream's own output and not a duplicate to collapse.
+                for origin_y in
+                    vyges_ifp::non_uniform_track_origins(die.1, row_h, yp, first_last_pitch)
+                {
+                    work.push((name.clone(), db.layer_get_offset_x(&name), xp, origin_y, row_h));
+                }
+                continue;
+            }
+
             if xp == 0 || yp == 0 {
                 // Upstream IFP-56: warn, and generate NO tracks for this layer.
                 vyges_events::emit(
