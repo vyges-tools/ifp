@@ -88,7 +88,7 @@ const DESCRIBE: &str = r#"{
       "Rows are named globally across sites (ROW_0, ROW_1, ...) rather than restarting per site, so adding a site renumbers the rows that follow it.",
       "Existing rows are cleared before the new ones are built. Anything already placed on the old row grid is not re-legalized by this engine.",
       "Written against the upstream ifp regression goldens at pin @OPENROAD_PIN@. The algorithm is reimplemented from the published behavior, not transliterated; where the two disagree the goldens are the arbiter.",
-      "MEASURED against that suite at the same pinned commit: 23 cases reproduce every compared IFP-* line exactly, 2 fail, and 15 are not comparable (6 utilization form, 6 polygon floorplans, 3 that never call initialize_floorplan).",
+      "MEASURED against that suite at the same pinned commit, re-run 2026-09-01: 23 cases reproduce every compared IFP-* line exactly, 0 fail, and 17 are not comparable (6 utilization form, 6 polygon floorplans, 3 that never call initialize_floorplan, 2 that need UPF). That number is about initialize_floorplan ALONE -- make-tracks, the engine's other command, is exercised by no case in that suite, so its correlation rests on unit tests rather than on the goldens.",
       "HYBRID SITES are supported: a site with a row pattern tiles the core from that pattern (IFP-0049) and every hybrid site additionally gets rows spanning a whole pattern each (IFP-0050), offset to where its pattern occurs in the base pattern -- matching as written (R0) or reversed with orientations mirrored (MX). Row parity is REFUSED on a hybrid floorplan (IFP-0051), because parity would have to trim whole patterns rather than rows.",
       "Sites are visited in NAME order and deduplicated by name, not in the order given on the command line -- row numbering and log order both follow from this. The site set also includes sites used by placed instances that were never named as arguments (upstream addUsedSites), excluding blocks.",
       "Known gap (1 remaining) -- UPF POWER DOMAINS. Upstream's floorplan inserts power-domain instances and its instance census rises accordingly (16 to 40 on upf_test); this engine inserts none. All floorplan GEOMETRY matches exactly on those cases; what differs is the instance census that follows from the count -- IFP-0103, IFP-0104 and IFP-0105 together.",
@@ -829,54 +829,58 @@ fn make_tracks(args: &[String]) -> ExitCode {
         // the arithmetic instead would change the guards on any layer near the die edge, and no
         // gate would see it — transcribe the reference's types, not just its logic.
         let min_width = db.layer_get_min_width(layer) as i32;
-        let px = vyges_ifp::track_pattern(die.0, dx, *xoff, *xpitch, min_width);
-        let py = vyges_ifp::track_pattern(die.1, dy, *yoff, *ypitch, min_width);
+        // ⛔ **One call for the whole layer, because upstream's skip is a `return` from
+        // `makeTracks` — not a per-axis decision.** The `return` sits above `findTrackGrid`, so an
+        // offset past the die on EITHER axis leaves the layer with no grid at all. Planning the
+        // two axes independently and skipping only the failing one emits exactly the right
+        // warning and still writes a pattern upstream never creates, which is why no comparison
+        // of log lines can see it. See `vyges_ifp::track_patterns`.
+        let (px, py) = match vyges_ifp::track_patterns(
+            die.0, dx, die.1, dy, *xoff, *xpitch, *yoff, *ypitch, min_width,
+        ) {
+            Ok(pair) => pair,
+            Err(axis) => {
+                // ⚠️ Upstream's own wording, verbatim. The conformance harness diffs emitted lines
+                // against the `.ok` golden, so the golden's phrasing IS the contract.
+                let (msg, code, why) = match axis {
+                    vyges_ifp::TrackSkip::X => (
+                        format!("IFP-0021 Track pattern for {layer} will be skipped due to \
+                                 x_offset > die width."),
+                        "IFP-TRACK-SKIP-X",
+                        "x_offset > die width (IFP-21)",
+                    ),
+                    vyges_ifp::TrackSkip::Y => (
+                        format!("IFP-0022 Track pattern for {layer} will be skipped due to \
+                                 y_offset > die height."),
+                        "IFP-TRACK-SKIP-Y",
+                        "y_offset > die height (IFP-22)",
+                    ),
+                };
+                vyges_events::emit(
+                    &vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Warn, msg)
+                        .with_code(code)
+                        .with_objects(vec![format!("layer:{layer}")]),
+                );
+                skipped.push(serde_json::json!({ "layer": layer, "why": why }));
+                continue;
+            }
+        };
         // ⛔ X then Y, on one grid -- `makeTracks`'s order.
-        if let Some(p) = px {
-            if let Err(e) = db.add_track_pattern_x(layer, p.origin, p.count, p.step) {
-                eprintln!("vyges-ifp make-tracks: {layer}: {e}");
-                return ExitCode::from(1);
-            }
-        } else {
-            // ⚠️ Upstream's own wording, verbatim. The conformance harness diffs emitted lines
-            // against the `.ok` golden, so the golden's phrasing IS the contract.
-            vyges_events::emit(
-                &vyges_events::Event::new(
-                    "vyges-ifp",
-                    vyges_events::Severity::Warn,
-                    format!("IFP-0021 Track pattern for {layer} will be skipped due to \
-                             x_offset > die width."),
-                )
-                .with_code("IFP-TRACK-SKIP-X")
-                .with_objects(vec![format!("layer:{layer}")]),
-            );
-            skipped.push(serde_json::json!({ "layer": layer, "why": "x_offset > die width (IFP-21)" }));
+        if let Err(e) = db.add_track_pattern_x(layer, px.origin, px.count, px.step) {
+            eprintln!("vyges-ifp make-tracks: {layer}: {e}");
+            return ExitCode::from(1);
         }
-        if let Some(p) = py {
-            if let Err(e) = db.add_track_pattern_y(layer, p.origin, p.count, p.step) {
-                eprintln!("vyges-ifp make-tracks: {layer}: {e}");
-                return ExitCode::from(1);
-            }
-        } else {
-            vyges_events::emit(
-                &vyges_events::Event::new(
-                    "vyges-ifp",
-                    vyges_events::Severity::Warn,
-                    format!("IFP-0022 Track pattern for {layer} will be skipped due to \
-                             y_offset > die height."),
-                )
-                .with_code("IFP-TRACK-SKIP-Y")
-                .with_objects(vec![format!("layer:{layer}")]),
-            );
-            skipped.push(serde_json::json!({ "layer": layer, "why": "y_offset > die height (IFP-22)" }));
+        if let Err(e) = db.add_track_pattern_y(layer, py.origin, py.count, py.step) {
+            eprintln!("vyges-ifp make-tracks: {layer}: {e}");
+            return ExitCode::from(1);
         }
-        if px.is_some() || py.is_some() {
-            made.push(serde_json::json!({
-                "layer": layer,
-                "x": px.map(|p| serde_json::json!({"origin": p.origin, "count": p.count, "step": p.step})),
-                "y": py.map(|p| serde_json::json!({"origin": p.origin, "count": p.count, "step": p.step})),
-            }));
-        }
+        // A layer is now all-or-nothing, so neither axis can be null here — a skipped layer
+        // appears in `skipped` alone, exactly as upstream leaves it with no grid.
+        made.push(serde_json::json!({
+            "layer": layer,
+            "x": {"origin": px.origin, "count": px.count, "step": px.step},
+            "y": {"origin": py.origin, "count": py.count, "step": py.step},
+        }));
     }
 
     let dest = out.unwrap_or(path);

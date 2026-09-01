@@ -1318,6 +1318,50 @@ pub fn track_pattern(
     Some(TrackPattern { origin, count, step: pitch })
 }
 
+/// Which axis' offset overflowed the die. Upstream returns on the FIRST one, so only one is ever
+/// reported even when both are out of range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackSkip {
+    /// `x_offset > die width` — IFP-21.
+    X,
+    /// `y_offset > die height` — IFP-22.
+    Y,
+}
+
+/// Upstream `InitFloorplan::makeTracks(layer, ...)` — the WHOLE function, both axes together.
+///
+/// ⛔ **The skip is the whole LAYER, not one axis.** Upstream tests `x_offset`, then `y_offset`,
+/// and `return`s from `makeTracks` on either — and the `return` sits *above* `findTrackGrid`, so
+/// neither `addGridPatternX` nor `addGridPatternY` runs. An out-of-range **y** offset therefore
+/// suppresses the **x** pattern too, even though x passed its own test.
+///
+/// 🔑 **This is why the axes cannot be planned independently.** Calling [`track_pattern`] once per
+/// axis and skipping only the failing one is a faithful transcription of the body placed in the
+/// wrong call structure — every warning is still correct, so no log comparison can see it.
+///
+/// Measured 2026-09-01 at pin `945a9f4` on upstream's own `make_tracks4`, the case written for
+/// this rule: the reference writes **zero** TRACKS for its two calls; the per-axis form wrote
+/// **two** patterns (a Y for the call whose x overflowed, an X for the call whose y overflowed),
+/// each with the reference's own numbers. The control — the same layer with both offsets in
+/// range — agrees exactly on both sides, which is what makes the difference attributable.
+pub fn track_patterns(
+    die_x: i32,
+    dx: i32,
+    die_y: i32,
+    dy: i32,
+    x_offset: i32,
+    x_pitch: i32,
+    y_offset: i32,
+    y_pitch: i32,
+    min_width: i32,
+) -> Result<(TrackPattern, TrackPattern), TrackSkip> {
+    // `?` reproduces the early return: X is tested first, and a failure on either axis leaves the
+    // caller with nothing to add.
+    let px = track_pattern(die_x, dx, x_offset, x_pitch, min_width).ok_or(TrackSkip::X)?;
+    let py = track_pattern(die_y, dy, y_offset, y_pitch, min_width).ok_or(TrackSkip::Y)?;
+    Ok((px, py))
+}
+
 /// Upstream `ifp::microns_to_mfg_grid` (`InitFloorplan.tcl:295`).
 ///
 /// 🔑 **Double rounding, and it is not decoration**: `round(round(um * dbu / grid) * grid)`. The
@@ -1356,6 +1400,35 @@ mod make_tracks_tests {
     #[test]
     fn an_offset_wider_than_the_die_skips_the_layer() {
         assert_eq!(track_pattern(0, 500, 600, 100, 0), None, "upstream warns and returns");
+    }
+
+    /// ⛔ **The skip is the whole LAYER.** `makeTracks` `return`s above `findTrackGrid`, so an
+    /// out-of-range offset on EITHER axis leaves the layer with no grid at all — the other axis
+    /// is not created, even when it passed its own test.
+    ///
+    /// Measured 2026-09-01 on upstream's `make_tracks4` (die 200x200 um, both calls on metal2):
+    /// the reference wrote **zero** TRACKS; planning the axes independently wrote two patterns.
+    #[test]
+    fn one_axis_over_the_die_suppresses_the_other_axis_too() {
+        // x overflows, y is perfectly legal on its own — upstream still creates nothing.
+        assert!(track_pattern(0, 1000, 100, 100, 0).is_some(), "y alone would be fine");
+        assert_eq!(track_patterns(0, 500, 0, 1000, 600, 100, 100, 100, 0), Err(TrackSkip::X));
+
+        // y overflows AFTER x has passed: upstream has computed nothing and returns.
+        assert!(track_pattern(0, 1000, 100, 100, 0).is_some(), "x alone would be fine");
+        assert_eq!(track_patterns(0, 1000, 0, 500, 100, 100, 600, 100, 0), Err(TrackSkip::Y));
+
+        // X is tested first, so a layer failing both is reported as X and never as Y.
+        assert_eq!(track_patterns(0, 500, 0, 500, 600, 100, 600, 100, 0), Err(TrackSkip::X));
+
+        // Both in range: the pair is created, and each axis matches the per-axis rule exactly.
+        assert_eq!(
+            track_patterns(0, 1000, 0, 1000, 100, 100, 100, 100, 0),
+            Ok((
+                track_pattern(0, 1000, 100, 100, 0).unwrap(),
+                track_pattern(0, 1000, 100, 100, 0).unwrap()
+            ))
+        );
     }
 
     /// The first-track guard moves the origin AND drops a track.
