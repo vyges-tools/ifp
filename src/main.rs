@@ -1630,6 +1630,9 @@ fn make_tracks(args: &[String]) -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // ⛔ Before any database exists: libodb then logs to the events trail (stderr) only, and
+    // stdout carries nothing but the report a caller parses.
+    vyges_opendb::init_events_logging();
 
     // 🔑 **The commit, not just the version.** Two binaries can share a version and differ by a
     // fix, so a bug report needs the build. build.rs prefers GITHUB_SHA on CI, which is what stops
