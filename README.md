@@ -9,11 +9,13 @@ that **writes** to the database rather than reading it.
 
 ```text
 vyges physical ifp run design.odb --die-area '0 0 1000 1000' --core-area '10 10 990 990' --site FreePDK45_38x28_10R_NP_162NW_34O
+vyges physical ifp run design.odb --utilization 40 --core-space '10 10 10 10' --site FreePDK45_38x28_10R_NP_162NW_34O
 ```
 
 ## What it does
 
-Given a die rectangle, a core rectangle and a site, it produces:
+Given a die rectangle, a core rectangle and a site — or a target utilization and core margins, from
+which the die is derived — it produces:
 
 - the **die area**, snapped to the manufacturing grid if the technology states one;
 - the **core area**, whose lower left is snapped *up* to the site grid;
@@ -42,17 +44,25 @@ get 999 if the last one did not fit.
 Die and core are given in **microns**, matching the upstream Tcl argument, and converted using the
 database's own `dbu_per_micron`. A database with no DBU scale is an error, not an assumed 1000.
 
+## The utilization form
+
+With `--utilization PCT` (and optionally an aspect ratio) and `--core-space`, the die is derived
+from the design's cell area in two steps, and the intermediate matters: the core width is taken
+from the square root of area over utilization and aspect ratio, truncated to a whole DBU; the core
+height is rounded from that already-truncated width; the die is laid around it and snapped to the
+manufacturing grid. The core is then taken back off the **snapped** die by the same margins, so it
+is not the rectangle the first step laid out. `--utilization` excludes `--die-area` (IFP-14) and
+`--core-area` (IFP-20), as upstream has it.
+
 ## What it does not do
 
-- The **utilization / aspect-ratio form** of `initialize_floorplan`, which derives a die from the
-  placed cell area, is not implemented. Give explicit rectangles.
 - It does not place or legalize anything. Cells already sitting on an old row grid are not moved.
 - It does not add tapcells, well taps, endcaps or a power grid; those are separate engines.
 
 ## Correctness — measured, not claimed
 
 The algorithm is written from the published behaviour of `initialize_floorplan` and checked against
-the upstream `ifp` regression goldens at pin `b5624809f29048e1f9ce9e83eb562620c652e084`. It is a
+the upstream `ifp` regression goldens at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`. It is a
 reimplementation, not a transliteration: where the two disagree, the goldens are the arbiter.
 
 The rules are stated separately from the code, and the arithmetic is split from
@@ -65,17 +75,19 @@ Against the upstream suite, at a pinned OpenROAD commit:
 
 | | |
 | --- | --- |
-| **23 pass** | every compared `IFP-*` line identical to the golden |
-| **2 fail** | the one gap below |
-| **15 not comparable** | 6 utilization form, 6 polygon floorplans, 3 cases that never call `initialize_floorplan` |
+| **36 pass** | every compared `IFP-*` line identical to the golden, utilization form included |
+| **0 fail** | |
+| **4 not comparable** | 2 that build no rows, and the 2 UPF cases below |
+| **31 / 31** | rows and die area identical to the DEF goldens upstream ships |
+| **8 / 8** | track patterns identical, of the 8 cases that call `make_tracks` |
 
 The comparison is on the `IFP-*` log lines, because those lines *are* what the algorithm decided:
 the snapped core origin, the row and site counts, and the resulting bboxes. Lines this engine does
 not emit are reported by the harness rather than dropped, so the pass count cannot flatter itself.
 
-### The one known gap
+### Not covered: UPF
 
-**UPF power domains** (2 cases). Upstream's floorplan inserts power-domain instances, so its
+**UPF power domains** (2 cases, needing upstream's separate `upf` module). Upstream's floorplan inserts power-domain instances, so its
 instance count rises (16 → 40 on `upf_test`). This engine inserts none. All floorplan *geometry*
 matches exactly on both cases; what differs is the census that follows from the count — IFP-0103,
 IFP-0104 and IFP-0105 together.
