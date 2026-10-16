@@ -12,6 +12,32 @@ use std::process::ExitCode;
 use vyges_ifp::{plan, Instance, OrientedSite, Plan, PlanError, Rect, RowParity, Site};
 use vyges_opendb::Db;
 
+/// A diagnostic as a structured event (`vyges-events/1.0`) rather than a bare stderr line: after the
+/// `vyges-ifp[ make-tracks]: ` prefix, a reference code (`IFP-1004 …`) is the event's code and opens
+/// its message, as the engine's other reference lines do; else the code is `IFP-ERROR`. Text after a
+/// blank line (the usage) stays plain help.
+fn diag_line(msg: String) {
+    let (head, help) = match msg.split_once("\n\n") {
+        Some((h, rest)) => (h.to_string(), Some(rest.to_string())),
+        None => (msg, None),
+    };
+    let text = head.strip_prefix("vyges-ifp make-tracks: ").or_else(|| head.strip_prefix("vyges-ifp: ")).unwrap_or(&head).to_string();
+    let code = text.split_whitespace().next().filter(|c| c.len() == 8 && c.starts_with("IFP-") && c[4..].bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
+    let ev = vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Error, text);
+    vyges_events::emit(&match code {
+        Some(c) => ev.with_code(c),
+        None => ev.with_code("IFP-ERROR"),
+    });
+    if let Some(h) = help {
+        eprintln!("{h}");
+    }
+}
+
+macro_rules! diag {
+    ($($t:tt)*) => { diag_line(format!($($t)*)) };
+}
+
+
 // ⚠️ The prefix here is the CLI GROUP this engine belongs to, and vyges-cli's MODULES
 // registry is what actually decides it (`group: "physical"`). It read `vyges loom ifp`
 // for a release after the construction engines were split out of the loom suite, because
@@ -761,7 +787,7 @@ fn refuse(e: PlanError, dbu: f64) -> ExitCode {
         ref other => other.to_string(),
     };
     vyges_events::emit(&Event::new("vyges-ifp", Severity::Error, text).with_code(code));
-    eprintln!("vyges-ifp: {e}");
+    diag!("vyges-ifp: {e}");
     ExitCode::from(1)
 }
 
@@ -903,7 +929,7 @@ fn run_polygon(
     let die_bbox = vyges_ifp::polygon_bbox(&die_poly);
     let core_bbox = vyges_ifp::polygon_bbox(&core_poly);
     if !die_bbox.contains(&core_bbox) {
-        eprintln!("vyges-ifp: IFP-1004 Die area must contain the core polygon bounding box.");
+        diag!("vyges-ifp: IFP-1004 Die area must contain the core polygon bounding box.");
         return ExitCode::from(1);
     }
     if let Err(e) = vyges_ifp::check_instance_dimensions(instances, core_bbox) {
@@ -911,11 +937,11 @@ fn run_polygon(
     }
 
     let Some(base) = sites.first() else {
-        eprintln!("vyges-ifp: no site to build rows from");
+        diag!("vyges-ifp: no site to build rows from");
         return ExitCode::from(1);
     };
     if base.is_hybrid() {
-        eprintln!("vyges-ifp: IFP-1000 Hybrid rows not yet supported with polygon-aware \
+        diag!("vyges-ifp: IFP-1000 Hybrid rows not yet supported with polygon-aware \
                    generation.");
         return ExitCode::from(1);
     }
@@ -949,7 +975,7 @@ fn run_polygon(
 
         for site in &ordered {
             if site.height % base.height != 0 {
-                eprintln!(
+                diag!(
                     "vyges-ifp: IFP-1001 Site {} height {:.3}um is not a multiple of site {} \
                      height {:.3}um.",
                     site.name, um(site.height), base.name, um(base.height)
@@ -968,17 +994,17 @@ fn run_polygon(
     // Write: the polygon die, then the rows, then the core area the rows cover.
     let flat: Vec<i32> = die_poly.iter().flat_map(|p| [p.0, p.1]).collect();
     if let Err(e) = db.set_die_area_polygon(&flat) {
-        eprintln!("vyges-ifp: cannot set the polygon die area: {e}");
+        diag!("vyges-ifp: cannot set the polygon die area: {e}");
         return ExitCode::from(2);
     }
     if let Err(e) = db.clear_rows() {
-        eprintln!("vyges-ifp: cannot clear the existing rows: {e}");
+        diag!("vyges-ifp: cannot clear the existing rows: {e}");
         return ExitCode::from(2);
     }
     for r in &rows {
         if let Err(e) = db.create_row(&r.name, &r.site, r.x, r.y, &r.orient, "HORIZONTAL",
                                       r.num_sites, r.spacing) {
-            eprintln!("vyges-ifp: cannot create {}: {e}", r.name);
+            diag!("vyges-ifp: cannot create {}: {e}", r.name);
             return ExitCode::from(2);
         }
     }
@@ -990,12 +1016,12 @@ fn run_polygon(
         ).with_code("IFP-POLYGON-ROWS").with_objects(vec![format!("site:{site}")]));
     }
     if let Err(e) = db.set_core_area_from_rows() {
-        eprintln!("vyges-ifp: cannot set the core area: {e}");
+        diag!("vyges-ifp: cannot set the core area: {e}");
         return ExitCode::from(2);
     }
     let _ = gap;   // the polygon path reaches updateVoltageDomain, which is not built here yet
     if let Err(e) = db.cut_rows_at_blockages(0, 0, 0, 0) {
-        eprintln!("vyges-ifp: cannot cut the rows around the blockages: {e}");
+        diag!("vyges-ifp: cannot cut the rows around the blockages: {e}");
         return ExitCode::from(2);
     }
 
@@ -1011,7 +1037,7 @@ fn run_polygon(
 
     let dest = cli.out_odb.clone().unwrap_or_else(|| cli.odb.clone());
     if let Err(e) = db.write(&dest) {
-        eprintln!("vyges-ifp: cannot write {dest}: {e}");
+        diag!("vyges-ifp: cannot write {dest}: {e}");
         return ExitCode::from(2);
     }
     ExitCode::SUCCESS
@@ -1021,7 +1047,7 @@ fn run(args: &[String]) -> ExitCode {
     match parse_args(args) {
         Ok(cli) => run_with(cli),
         Err(e) => {
-            eprintln!("vyges-ifp: {e}\n\n{USAGE}");
+            diag!("vyges-ifp: {e}\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
@@ -1037,7 +1063,7 @@ fn make_rows_cmd(args: &[String]) -> ExitCode {
     match parse_args_make_rows(args) {
         Ok(cli) => run_with(cli),
         Err(e) => {
-            eprintln!("vyges-ifp: {e}\n\n{USAGE}");
+            diag!("vyges-ifp: {e}\n\n{USAGE}");
             ExitCode::from(2)
         }
     }
@@ -1047,13 +1073,13 @@ fn run_with(cli: Cli) -> ExitCode {
     let mut db = match Db::open(&cli.odb) {
         Ok(db) => db,
         Err(e) => {
-            eprintln!("vyges-ifp: cannot read {}: {e}", cli.odb);
+            diag!("vyges-ifp: cannot read {}: {e}", cli.odb);
             return ExitCode::from(2);
         }
     };
     let dbu = db.dbu_per_micron();
     if dbu <= 0 {
-        eprintln!("vyges-ifp: no DBU scale; cannot convert microns");
+        diag!("vyges-ifp: no DBU scale; cannot convert microns");
         return ExitCode::from(2);
     }
     let dbu_f = dbu as f64;
@@ -1064,7 +1090,7 @@ fn run_with(cli: Cli) -> ExitCode {
     for name in std::iter::once(&cli.site).chain(cli.additional.iter()) {
         let (w, h) = (db.site_get_width(name), db.site_get_height(name));
         if w <= 0 || h <= 0 {
-            eprintln!(
+            diag!(
                 "vyges-ifp: site `{name}` is unknown or has no extent ({w} x {h}); \
                  the library defines: {}",
                 db.site_names().map(|v| v.join(", ")).unwrap_or_default()
@@ -1087,7 +1113,7 @@ fn run_with(cli: Cli) -> ExitCode {
                 })
                 .collect(),
             Err(e) => {
-                eprintln!("vyges-ifp: cannot read the row pattern of `{name}`: {e}");
+                diag!("vyges-ifp: cannot read the row pattern of `{name}`: {e}");
                 return ExitCode::from(2);
             }
         };
@@ -1141,7 +1167,7 @@ fn run_with(cli: Cli) -> ExitCode {
     let grid = match db.manufacturing_grid() {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("vyges-ifp: cannot read the manufacturing grid: {e}");
+            diag!("vyges-ifp: cannot read the manufacturing grid: {e}");
             return ExitCode::from(2);
         }
     };
@@ -1335,12 +1361,12 @@ fn run_with(cli: Cli) -> ExitCode {
     let mut written: Option<String> = None;
     if !cli.dry_run {
         if let Err(e) = apply(&mut db, &p, split_rows.as_deref(), !cli.make_rows) {
-            eprintln!("vyges-ifp: {e}");
+            diag!("vyges-ifp: {e}");
             return ExitCode::from(2);
         }
         let out = cli.out_odb.clone().unwrap_or_else(|| cli.odb.clone());
         if let Err(e) = db.write(&out) {
-            eprintln!("vyges-ifp: cannot write {out}: {e}");
+            diag!("vyges-ifp: cannot write {out}: {e}");
             return ExitCode::from(2);
         }
         written = Some(out);
@@ -1353,7 +1379,7 @@ fn run_with(cli: Cli) -> ExitCode {
     match cli.report.as_deref() {
         Some(f) => {
             if let Err(e) = std::fs::write(f, format!("{json}\n")) {
-                eprintln!("vyges-ifp: cannot write {f}: {e}");
+                diag!("vyges-ifp: cannot write {f}: {e}");
                 return ExitCode::from(2);
             }
         }
@@ -1391,7 +1417,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 match args.get(i) {
                     Some(v) => out = Some(v),
                     None => {
-                        eprintln!("vyges-ifp make-tracks: --out-odb needs a FILE");
+                        diag!("vyges-ifp make-tracks: --out-odb needs a FILE");
                         return ExitCode::from(2);
                     }
                 }
@@ -1399,16 +1425,16 @@ fn make_tracks(args: &[String]) -> ExitCode {
             "--track" => {
                 i += 1;
                 let Some(spec) = args.get(i) else {
-                    eprintln!("vyges-ifp make-tracks: --track needs LAYER:xoff,xpitch,yoff,ypitch");
+                    diag!("vyges-ifp make-tracks: --track needs LAYER:xoff,xpitch,yoff,ypitch");
                     return ExitCode::from(2);
                 };
                 let Some((layer, rest)) = spec.split_once(':') else {
-                    eprintln!("vyges-ifp make-tracks: --track wants LAYER:xoff,xpitch,yoff,ypitch");
+                    diag!("vyges-ifp make-tracks: --track wants LAYER:xoff,xpitch,yoff,ypitch");
                     return ExitCode::from(2);
                 };
                 let f: Vec<&str> = rest.split(',').collect();
                 if f.len() != 4 {
-                    eprintln!("vyges-ifp make-tracks: --track wants four values, got {rest:?}");
+                    diag!("vyges-ifp make-tracks: --track wants four values, got {rest:?}");
                     return ExitCode::from(2);
                 }
                 let mut v = [0.0f64; 4];
@@ -1416,7 +1442,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
                     match t.trim().parse::<f64>() {
                         Ok(x) => v[k] = x,
                         Err(_) => {
-                            eprintln!("vyges-ifp make-tracks: not a number: {t:?}");
+                            diag!("vyges-ifp make-tracks: not a number: {t:?}");
                             return ExitCode::from(2);
                         }
                     }
@@ -1424,7 +1450,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 explicit.push((layer.to_string(), v));
             }
             a if a.starts_with("--") => {
-                eprintln!("vyges-ifp make-tracks: unknown option {a}");
+                diag!("vyges-ifp make-tracks: unknown option {a}");
                 return ExitCode::from(2);
             }
             a => path = Some(a),
@@ -1433,14 +1459,14 @@ fn make_tracks(args: &[String]) -> ExitCode {
     }
 
     let Some(path) = path else {
-        eprintln!("vyges-ifp make-tracks: needs <design.odb>");
+        diag!("vyges-ifp make-tracks: needs <design.odb>");
         return ExitCode::from(2);
     };
 
     let mut db = match vyges_opendb::Db::open(path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("vyges-ifp make-tracks: cannot read {path}: {e}");
+            diag!("vyges-ifp make-tracks: cannot read {path}: {e}");
             return ExitCode::from(2);
         }
     };
@@ -1494,12 +1520,12 @@ fn make_tracks(args: &[String]) -> ExitCode {
             let first_last_pitch = db.layer_get_first_last_pitch(&name);
             if first_last_pitch > 0 {
                 if dir != "HORIZONTAL" {
-                    eprintln!("vyges-ifp make-tracks: IFP-0044 Non horizontal layer {name} uses \
+                    diag!("vyges-ifp make-tracks: IFP-0044 Non horizontal layer {name} uses \
                                property LEF58_PITCH.");
                     return ExitCode::from(1);
                 }
                 let Some(row_h) = core_row_height else {
-                    eprintln!("vyges-ifp make-tracks: IFP-0045 No routing Row found in layer \
+                    diag!("vyges-ifp make-tracks: IFP-0045 No routing Row found in layer \
                                {name}");
                     return ExitCode::from(1);
                 };
@@ -1507,7 +1533,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 // here. A tool must not fault on a technology file, so this is refused with a
                 // reason -- recorded in the divergence register rather than left to trap.
                 if yp == 0 {
-                    eprintln!("vyges-ifp make-tracks: layer {name} carries LEF58_PITCH but no \
+                    diag!("vyges-ifp make-tracks: layer {name} carries LEF58_PITCH but no \
                                y pitch to space its tracks by.");
                     return ExitCode::from(1);
                 }
@@ -1548,7 +1574,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
     }
 
     if work.is_empty() {
-        eprintln!("vyges-ifp make-tracks: no routing layer produced a track pattern.");
+        diag!("vyges-ifp make-tracks: no routing layer produced a track pattern.");
         return ExitCode::from(3);
     }
 
@@ -1596,11 +1622,11 @@ fn make_tracks(args: &[String]) -> ExitCode {
         };
         // ⛔ X then Y, on one grid -- `makeTracks`'s order.
         if let Err(e) = db.add_track_pattern_x(layer, px.origin, px.count, px.step) {
-            eprintln!("vyges-ifp make-tracks: {layer}: {e}");
+            diag!("vyges-ifp make-tracks: {layer}: {e}");
             return ExitCode::from(1);
         }
         if let Err(e) = db.add_track_pattern_y(layer, py.origin, py.count, py.step) {
-            eprintln!("vyges-ifp make-tracks: {layer}: {e}");
+            diag!("vyges-ifp make-tracks: {layer}: {e}");
             return ExitCode::from(1);
         }
         // A layer is now all-or-nothing, so neither axis can be null here — a skipped layer
@@ -1614,7 +1640,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
 
     let dest = out.unwrap_or(path);
     if let Err(e) = db.write(dest) {
-        eprintln!("vyges-ifp make-tracks: cannot write {dest}: {e}");
+        diag!("vyges-ifp make-tracks: cannot write {dest}: {e}");
         return ExitCode::from(2);
     }
     // ⚠️ PRETTY, like `run`'s hand-built report. `json!`'s Display is compact, and a chain that
@@ -1668,7 +1694,7 @@ fn main() -> ExitCode {
         return make_tracks(&args[1..]);
     }
     if args[0] != "run" {
-        eprintln!("vyges-ifp: unknown command `{}`\n\n{USAGE}", args[0]);
+        diag!("vyges-ifp: unknown command `{}`\n\n{USAGE}", args[0]);
         return ExitCode::from(2);
     }
     run(&args[1..])
