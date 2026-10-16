@@ -1242,23 +1242,26 @@ fn run_with(cli: Cli) -> ExitCode {
         Some(util) => {
             let sp = cli.core_space.expect("checked when the arguments were parsed");
             let aspect = cli.aspect_ratio.unwrap_or(1.0);   // upstream's default is 1.0
-            // Upstream's validators, in its own order: IFP-12 then IFP-36, then the spacings.
+            // Upstream's validators, in its own order: IFP-12 then IFP-36, then the spacings —
+            // each the validator's own message (`{name} {value} not >= {limit}`, `>` for positive).
+            let validator_error = |code: &str, msg: String| {
+                vyges_events::emit(&vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Error, format!("{code} {msg}")).with_code(code));
+                ExitCode::from(1)
+            };
             if util < 0.0 {
-                eprintln!("vyges-ifp: IFP-0012 utilization must be non-negative ({util})");
-                return ExitCode::from(1);
+                return validator_error("IFP-0012", format!("utilization {util} not >= 0"));
             }
             if aspect <= 0.0 {
-                eprintln!("vyges-ifp: IFP-0036 aspect_ratio must be positive ({aspect})");
-                return ExitCode::from(1);
+                return validator_error("IFP-0036", format!("aspect_ratio {aspect} not > 0"));
             }
-            // IFP-32..35, one per side, checked in MICRONS as upstream does.
+            // IFP-32..35, one per side, on the spacing in DBU back in microns (`dbuToMicrons`);
+            // the name carries a trailing blank, so two separate it from the value.
             for (v, code, what) in [
-                (sp[0], 32, "core_space_bottom"), (sp[1], 33, "core_space_top"),
-                (sp[2], 34, "core_space_left"), (sp[3], 35, "core_space_right"),
+                (sp[0], "IFP-0032", "core_space_bottom"), (sp[1], "IFP-0033", "core_space_top"),
+                (sp[2], "IFP-0034", "core_space_left"), (sp[3], "IFP-0035", "core_space_right"),
             ] {
                 if v < 0.0 {
-                    eprintln!("vyges-ifp: IFP-00{code} {what} (um) must be non-negative ({v})");
-                    return ExitCode::from(1);
+                    return validator_error(code, format!("{what} (um)  {} not >= 0", f64::from(to_dbu(v, dbu_f)) / dbu_f));
                 }
             }
             let (b, t, l, r) = (to_dbu(sp[0], dbu_f), to_dbu(sp[1], dbu_f),
