@@ -463,14 +463,15 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
     }
 
     // The census upstream prints after a floorplan, reproduced so a log diff against
-    // `initialize_floorplan` compares like with like.
+    // `initialize_floorplan` compares like with like. The lines are padded as the reference pads
+    // them (`{:10}` / `{:6.3f}`, `{:27}` / `{:15.3f}`): a label left-aligned, a number right.
     let design_um2 = vyges_ifp::design_area(instances) / (dbu * dbu);
     let core_um2 = um(p.core_final.dx()) * um(p.core_final.dy());
     let mut census = vec![
         (
             "IFP-CENSUS-DIE",
             format!(
-                "IFP-0100 Die BBox: ( {:.3} {:.3} ) ( {:.3} {:.3} ) um",
+                "IFP-0100 {:10} ( {:6.3} {:6.3} ) ( {:6.3} {:6.3} ) um", "Die BBox:",
                 um(p.die.x_min),
                 um(p.die.y_min),
                 um(p.die.x_max),
@@ -480,7 +481,7 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
         (
             "IFP-CENSUS-CORE",
             format!(
-                "IFP-0101 Core BBox: ( {:.3} {:.3} ) ( {:.3} {:.3} ) um",
+                "IFP-0101 {:10} ( {:6.3} {:6.3} ) ( {:6.3} {:6.3} ) um", "Core BBox:",
                 um(p.core_final.x_min),
                 um(p.core_final.y_min),
                 um(p.core_final.x_max),
@@ -489,11 +490,11 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
         ),
         (
             "IFP-CENSUS-AREA",
-            format!("IFP-0102 Core area: {core_um2:.3} um^2"),
+            format!("IFP-0102 {:27} {core_um2:15.3} um^2", "Core area:"),
         ),
         (
             "IFP-CENSUS-DESIGN-AREA",
-            format!("IFP-0103 Total instances area: {design_um2:.3} um^2"),
+            format!("IFP-0103 {:27} {design_um2:15.3} um^2", "Total instances area:"),
         ),
     ];
     // Upstream prints utilization only when there is a core to divide by, and so do we: a
@@ -502,14 +503,14 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
         census.push((
             "IFP-CENSUS-UTIL",
             format!(
-                "IFP-0104 Effective utilization: {:.3}",
+                "IFP-0104 {:27} {:15.3}", "Effective utilization:",
                 design_um2 / core_um2
             ),
         ));
     }
     census.push((
         "IFP-CENSUS-INSTS",
-        format!("IFP-0105 Number of instances: {num_insts}"),
+        format!("IFP-0105 {:27} {num_insts:15}", "Number of instances:"),
     ));
     for (code, text) in census {
         vyges_events::emit(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
@@ -785,21 +786,21 @@ fn report_polygon_areas(db: &Db, dbu: f64, instances: &[Instance]) {
 
     let mut census: Vec<(&str, String)> = vec![
         ("IFP-CENSUS-DIE", format!(
-            "IFP-0100 Die BBox: ( {:.3} {:.3} ) ( {:.3} {:.3} ) um",
+            "IFP-0100 {:10} ( {:6.3} {:6.3} ) ( {:6.3} {:6.3} ) um", "Die BBox:",
             um(dxa), um(dya), um(dxb), um(dyb))),
         ("IFP-CENSUS-CORE", format!(
-            "IFP-0101 Core BBox: ( {:.3} {:.3} ) ( {:.3} {:.3} ) um",
+            "IFP-0101 {:10} ( {:6.3} {:6.3} ) ( {:6.3} {:6.3} ) um", "Core BBox:",
             um(cxa), um(cya), um(cxb), um(cyb))),
-        ("IFP-CENSUS-AREA", format!("IFP-0102 Core area: {core_um2:.3} um^2")),
+        ("IFP-CENSUS-AREA", format!("IFP-0102 {:27} {core_um2:15.3} um^2", "Core area:")),
         ("IFP-CENSUS-DESIGN-AREA",
-         format!("IFP-0103 Total instances area: {design_um2:.3} um^2")),
+         format!("IFP-0103 {:27} {design_um2:15.3} um^2", "Total instances area:")),
     ];
     if core_um2 > 0.0 {
         census.push(("IFP-CENSUS-UTIL",
-            format!("IFP-0104 Effective utilization: {:.3}", design_um2 / core_um2)));
+            format!("IFP-0104 {:27} {:15.3}", "Effective utilization:", design_um2 / core_um2)));
     }
     census.push(("IFP-CENSUS-INSTS",
-        format!("IFP-0105 Number of instances: {}", db.num_insts())));
+        format!("IFP-0105 {:27} {:15}", "Number of instances:", db.num_insts())));
     for (code, text) in census {
         vyges_events::emit(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
     }
