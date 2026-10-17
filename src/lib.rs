@@ -1920,7 +1920,7 @@ mod voltage_domain_tests {
         //
         // y=230 -> y_max 240, and 240 + 60 == 300 exactly, so the row is KEPT. The comparison is
         // `<=`, and a row touching the margin edge survives.
-        let kept = split_rows_for_domains(vec![row("R", 230, "s")], &[d.clone()], core, None, &h, &pad);
+        let kept = split_rows_for_domains(vec![row("R", 230, "s")], std::slice::from_ref(&d), core, None, &h, &pad);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].name, "R", "exactly on the margin edge, so untouched");
 
@@ -2040,6 +2040,7 @@ pub enum TrackSkip {
 /// **two** patterns (a Y for the call whose x overflowed, an X for the call whose y overflowed),
 /// each with the reference's own numbers. The control — the same layer with both offsets in
 /// range — agrees exactly on both sides, which is what makes the difference attributable.
+#[allow(clippy::too_many_arguments)] // the reference's own argument list
 pub fn track_patterns(
     die_x: i32,
     dx: i32,

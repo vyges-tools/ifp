@@ -891,7 +891,7 @@ fn run_polygon(
         return fail("IFP-NO-DIE-POLYGON",
                     "IFP-0075 no -die_area specified for polygon floorplan.".to_string());
     }
-    if cli.die_pts.len() % 2 != 0 {
+    if !cli.die_pts.len().is_multiple_of(2) {
         return fail("IFP-DIE-POLYGON-ODD",
             "IFP-0076 -die_area must have an even number of coordinates (x y pairs).".to_string());
     }
@@ -916,7 +916,7 @@ fn run_polygon(
         return fail("IFP-NO-CORE-POLYGON",
                     "IFP-0085 no -core_area specified for polygonal floorplan.".to_string());
     }
-    if cli.core_pts.len() % 2 != 0 {
+    if !cli.core_pts.len().is_multiple_of(2) {
         return fail("IFP-CORE-POLYGON-ODD",
             "IFP-0082 -core_area must have an even number of coordinates (x y pairs).".to_string());
     }
@@ -953,7 +953,6 @@ fn run_polygon(
 
     let mut rows: Vec<vyges_ifp::Row> = Vec::new();
     let mut per_site: Vec<(String, usize)> = Vec::new();
-    let mut snapped_bbox = core_bbox;
 
     // ⚠️ The whole row-building step is inside upstream's non-negative guard; a core whose lower
     // left is negative produces NO rows and still reaches the blockage cutting below.
@@ -971,7 +970,7 @@ fn run_polygon(
                 ),
             ).with_code("IFP-POLYGON-BBOX-SNAPPED"));
         }
-        snapped_bbox = Rect::new(clx, cly, core_bbox.x_max, core_bbox.y_max);
+        let snapped_bbox = Rect::new(clx, cly, core_bbox.x_max, core_bbox.y_max);
 
         for site in &ordered {
             if site.height % base.height != 0 {
@@ -1316,7 +1315,7 @@ fn run_with(cli: Cli) -> ExitCode {
     }
     };
 
-    let mut p = match plan(
+    let p = match plan(
         die_in,
         core_in,
         &sites,
