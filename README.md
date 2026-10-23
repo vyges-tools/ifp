@@ -27,13 +27,13 @@ change leaves no remnant of the previous grid.
 
 ## Two behaviours worth knowing before you read the output back
 
-Both are upstream `initialize_floorplan` behaviours, reproduced deliberately, and both surprise
+Both are reference `initialize_floorplan` behaviours, reproduced deliberately, and both surprise
 callers who expect their arguments to survive:
 
 **The core's lower left moves; its upper right does not.** The lower left is rounded *up* to a whole
 site so rows begin on a legal boundary. The upper right is left exactly where it was asked for,
 because the row and site *counts* are what decide where the core really ends. When this moves, the
-engine says so (`IFP-CORE-SNAP`, upstream IFP-28) rather than adjusting quietly.
+engine says so (`IFP-CORE-SNAP`, reference IFP-28) rather than adjusting quietly.
 
 **The core area you read back is not the core area you asked for.** After the rows are built, the
 stored core area is replaced by the rectangle the rows cover. Ask for a core 1000 sites wide and
@@ -41,7 +41,7 @@ get 999 if the last one did not fit.
 
 ## Units
 
-Die and core are given in **microns**, matching the upstream Tcl argument, and converted using the
+Die and core are given in **microns**, matching the reference Tcl argument, and converted using the
 database's own `dbu_per_micron`. A database with no DBU scale is an error, not an assumed 1000.
 
 ## The utilization form
@@ -52,7 +52,7 @@ from the square root of area over utilization and aspect ratio, truncated to a w
 height is rounded from that already-truncated width; the die is laid around it and snapped to the
 manufacturing grid. The core is then taken back off the **snapped** die by the same margins, so it
 is not the rectangle the first step laid out. `--utilization` excludes `--die-area` (IFP-14) and
-`--core-area` (IFP-20), as upstream has it.
+`--core-area` (IFP-20), as the reference has it.
 
 ## What it does not do
 
@@ -62,23 +62,23 @@ is not the rectangle the first step laid out. `--utilization` excludes `--die-ar
 ## Correctness — measured, not claimed
 
 The algorithm is written from the published behaviour of `initialize_floorplan` and checked against
-the upstream `ifp` regression goldens at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`. It is a
+the reference `ifp` regression goldens at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`. It is a
 reimplementation, not a transliteration: where the two disagree, the goldens are the arbiter.
 
 The rules are stated separately from the code, and the arithmetic is split from
 the database so every rule is testable without an `.odb`. The reference case in the unit tests
-reproduces each number in `init_floorplan1.ok` — the snapped origin, the row count, the sites per
+reproduces each number in the reference suite's first floorplan golden — the snapped origin, the row count, the sites per
 row, and the final core rectangle — and the integration tests confirm those numbers survive the
 write and a read-back through an independent reader.
 
-Against the upstream suite, at a pinned OpenROAD commit:
+Against the reference suite, at a pinned reference commit:
 
 | | |
 | --- | --- |
 | **36 pass** | every compared `IFP-*` line identical to the golden, utilization form included |
 | **0 fail** | |
 | **4 not comparable** | 2 that build no rows, and the 2 UPF cases below |
-| **31 / 31** | rows and die area identical to the DEF goldens upstream ships |
+| **31 / 31** | rows and die area identical to the DEF goldens the reference ships |
 | **8 / 8** | track patterns identical, of the 8 cases that call `make_tracks` |
 
 The comparison is on the `IFP-*` log lines, because those lines *are* what the algorithm decided:
@@ -87,8 +87,8 @@ not emit are reported by the harness rather than dropped, so the pass count cann
 
 ### Not covered: UPF
 
-**UPF power domains** (2 cases, needing upstream's separate `upf` module). Upstream's floorplan inserts power-domain instances, so its
-instance count rises (16 → 40 on `upf_test`). This engine inserts none. All floorplan *geometry*
+**UPF power domains** (2 cases, needing the reference's separate `upf` module). The reference floorplan inserts power-domain instances, so its
+instance count rises (16 → 40 on one of them). This engine inserts none. All floorplan *geometry*
 matches exactly on both cases; what differs is the census that follows from the count — IFP-0103,
 IFP-0104 and IFP-0105 together.
 
@@ -121,7 +121,7 @@ excluded), because a hybrid library can place cells on a site nobody mentioned.
 ## The fit check
 
 A master larger than the core is refused (IFP-0002) before anything is snapped or written. Three
-details are upstream's, and each one changes the answer:
+details are the reference's, and each one changes the answer:
 
 - the check runs **after** the die tests, so a design with both an empty die and an oversized macro
   reports the die — the error a caller can actually act on;
