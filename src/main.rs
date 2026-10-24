@@ -77,6 +77,9 @@ OPTIONS:
   --row-parity NONE|ODD|EVEN trim the row count to a parity (default NONE)
   --flip-sites A,B           shift the row-orientation phase for these sites
   --gap MICRONS              margin around a voltage domain (default: 6 x the site height)
+  --liberty FILE             a Liberty library the design was read with (repeatable, in read
+                             order); a design with power intent takes its isolation cells and
+                             level shifters from these
   --out-odb FILE             write the database here (default: IN PLACE, over the input)
   --dry-run                  plan and report, write nothing
   -o FILE                    write the report to FILE instead of stdout
@@ -88,6 +91,7 @@ EXIT STATUS:
   1  refused     the design cannot be floorplanned as asked (empty die, core outside the
                  die, degenerate or mismatched site, or no row fits)
   2  error       usage error, unreadable database, no DBU scale, or a failed write
+  3  refused     the power-intent evaluator does not implement what the design needs yet
 ";
 
 
@@ -133,7 +137,7 @@ const DESCRIBE: &str = r#"{
       "ROWS ARE CUT against the block's placement blockages, using OpenDB's own cutRows rather than a reimplementation of it. This runs last and unconditionally; a design that declares no blockage is unaffected.",
       "SCOPE -- upstream ifp exposes FOUR commands and this engine implements THREE: initialize_floorplan is `run`, make_rows is `make-rows`, make_tracks is `make-tracks`. insert_tiecells is NOT implemented.",
       "make-rows builds rows on a die the database already holds and never writes a die of its own. The core is given explicitly or as margins off that die, and an empty die is refused with IFP-63 or IFP-64 depending on which of the two forms was used -- upstream uses two codes for the one condition.",
-      "Known gap -- UPF POWER DOMAINS. Upstream's floorplan inserts power-domain instances and its instance census rises accordingly (16 to 40 on upf_test); this engine inserts none. All floorplan GEOMETRY matches exactly on those cases; what differs is the instance census that follows from the count -- IFP-0103, IFP-0104 and IFP-0105 together.",
+      "POWER INTENT is made physical inside row building, as upstream does it: after the die, core and instance-fit checks, before the core is snapped to the site grid, and only when the core's lower left is non-negative. The work is done by the power-intent engine (vyges-upf eval, or $VYGES_UPF_BIN) -- fence regions and groups per domain, logic-port nets, isolation cells and level shifters -- given the --liberty files in read order; its messages appear in place and the closing census counts the cells it inserted. A design with no power domain and no logic port runs nothing. A design WITH power intent and no evaluator available is an error (2), never a floorplan without it; the evaluator's error stops the floorplan (1), its refusal is refused (3).",
       "A macro larger than the core area is refused with IFP-0002 before anything is snapped or written, matching upstream's ordering: the die checks come first, so a design with both an empty die and an oversized macro reports the die. Pads and covers are exempt, and a master with R90 symmetry is measured against the core's larger dimension because it is free to rotate.",
       "The instance census (IFP-0103 total instance area, IFP-0104 effective utilization) counts EVERY instance's master area, including the pads and covers the fit check skips -- it is a census of the design, not a question about the core. Utilization is omitted rather than printed as infinity when the core area is zero.",
       "make-tracks covers BOTH pitch forms. A layer whose technology carries LEF58_PITCH (FIRSTLASTPITCH) is not one grid at the layer pitch: it expands into a stack of patterns, one per track within the cell row, each repeating on the CORE ROW HEIGHT, with one further pattern past the end. A layer whose x or y offset runs past the die is skipped ENTIRELY -- both axes, not just the one that overran.",
@@ -201,6 +205,9 @@ struct Cli {
     /// `make_rows` rather than `initialize_floorplan`: the die is READ from the database instead
     /// of written, and everything else about row building is the same.
     make_rows: bool,
+    /// Liberty libraries, in read order, handed to the power-intent evaluator: it picks the
+    /// isolation cells and level shifters it inserts from them.
+    liberty: Vec<String>,
 }
 
 /// `x1 y1 x2 y2`, whitespace- or comma-separated.
@@ -269,6 +276,7 @@ fn parse_args_inner(args: &[String], make_rows: bool) -> Result<Cli, String> {
         utilization: None,
         aspect_ratio: None,
         core_space: None,
+        liberty: Vec::new(),
     };
 
     let mut i = 0;
@@ -349,6 +357,7 @@ fn parse_args_inner(args: &[String], make_rows: bool) -> Result<Cli, String> {
             "--out-odb" => cli.out_odb = Some(value()?),
             "-o" => cli.report = Some(value()?),
             "--dry-run" => cli.dry_run = true,
+            "--liberty" => cli.liberty.push(value()?),
             "--json" => {} // the only format today; accepted so callers can be explicit
             a if a.starts_with('-') => return Err(format!("unknown option `{a}`")),
             a => odb = Some(a.to_string()),
@@ -889,6 +898,85 @@ fn report_polygon_areas(db: &Db, dbu: f64, instances: &[Instance]) {
 /// ⚠️ **`points.size() - 1`**: odb closes the ring, so an 8-vertex input reads back as 9 points
 /// and the line prints 8.
 #[allow(clippy::too_many_arguments)]
+/// Every instance with its master's dimensions and placement class, in database order.
+fn read_instances(db: &Db) -> Vec<Instance> {
+    db.inst_names()
+        .into_iter()
+        .map(|name| {
+            let m = db.inst_master(&name);
+            Instance {
+                name,
+                width: db.master_get_width(&m) as i32,
+                height: db.master_get_height(&m) as i32,
+                is_pad: db.master_is_pad(&m),
+                is_cover: db.master_is_cover(&m),
+                symmetry_r90: db.master_get_symmetry_r90(&m),
+            }
+        })
+        .collect()
+}
+
+/// Make the design's power intent physical, at the point row building does it: a fence region
+/// and group per power domain, logic-port nets and terminals, isolation cells and level shifters
+/// between domains. A design with no power domain and no logic port has nothing to evaluate, and
+/// nothing is run.
+///
+/// The work is the power-intent engine's (`vyges-upf eval`, or `$VYGES_UPF_BIN`), run on a copy
+/// of the database; its messages are relayed in order and the database is replaced by its
+/// output. Its stops become ours: a reported `[ERROR ...]` stops the floorplan (exit 1), a step
+/// it does not implement is refused (exit 3), anything else is an error (exit 2).
+///
+/// ⛔ **A design with power intent is never floorplanned without it.** Skipping the evaluation
+/// leaves out every inserted cell and fence, and the floorplan would look complete.
+fn eval_power_intent(db: &mut Db, liberty: &[String]) -> Result<(), ExitCode> {
+    if db.block_get_power_domains().is_empty() && db.block_get_logic_ports().is_empty() {
+        return Ok(());
+    }
+    let bin = std::env::var("VYGES_UPF_BIN").unwrap_or_else(|_| "vyges-upf".to_string());
+    let dir = std::env::temp_dir().join(format!("vyges-ifp-upf-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        diag!("vyges-ifp: cannot make a work directory for the power intent: {e}");
+        return Err(ExitCode::from(2));
+    }
+    let (input, output) = (dir.join("in.odb"), dir.join("out.odb"));
+    let result = (|| {
+        db.write(&input).map_err(|e| {
+            diag!("vyges-ifp: cannot write the database for the power intent: {e}");
+            ExitCode::from(2)
+        })?;
+        let mut cmd = std::process::Command::new(&bin);
+        cmd.arg("eval").arg(&input).arg("-o").arg(&output);
+        for f in liberty {
+            cmd.arg("--liberty").arg(f);
+        }
+        let run = cmd.output().map_err(|e| {
+            diag!(
+                "vyges-ifp: the design carries power intent and the power-intent engine \
+                 `{bin}` could not be run ({e}); install it or set VYGES_UPF_BIN"
+            );
+            ExitCode::from(2)
+        })?;
+        let said = String::from_utf8_lossy(&run.stdout);
+        for line in said.lines() {
+            eprintln!("{line}");
+        }
+        eprint!("{}", String::from_utf8_lossy(&run.stderr));
+        match run.status.code() {
+            Some(0) => {}
+            Some(3) => return Err(ExitCode::from(3)),
+            _ if said.lines().any(|l| l.starts_with("[ERROR ")) => return Err(ExitCode::from(1)),
+            _ => return Err(ExitCode::from(2)),
+        }
+        *db = Db::open(&output).map_err(|e| {
+            diag!("vyges-ifp: cannot read the evaluated database back: {e}");
+            ExitCode::from(2)
+        })?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
 fn run_polygon(
     db: &mut Db,
     cli: &Cli,
@@ -991,7 +1079,13 @@ fn run_polygon(
 
     // ⚠️ The whole row-building step is inside upstream's non-negative guard; a core whose lower
     // left is negative produces NO rows and still reaches the blockage cutting below.
+    let mut fresh = None;
     if core_bbox.x_min >= 0 && core_bbox.y_min >= 0 {
+        // Power intent is made physical first, as on the rectangular path.
+        if let Err(code) = eval_power_intent(db, &cli.liberty) {
+            return code;
+        }
+        fresh = Some(read_instances(db));
         let clx = vyges_ifp::div_ceil(core_bbox.x_min, base.width) * base.width;
         let cly = vyges_ifp::div_ceil(core_bbox.y_min, base.height) * base.height;
         if clx != core_bbox.x_min || cly != core_bbox.y_min {
@@ -1067,7 +1161,7 @@ fn run_polygon(
                 core_poly.len()),
     ).with_code("IFP-POLYGON-COMPLETE"));
 
-    report_polygon_areas(db, dbu_f, instances);
+    report_polygon_areas(db, dbu_f, fresh.as_deref().unwrap_or(instances));
 
     let dest = cli.out_odb.clone().unwrap_or_else(|| cli.odb.clone());
     if let Err(e) = db.write(&dest) {
@@ -1242,21 +1336,7 @@ fn run_with(cli: Cli) -> ExitCode {
     };
     // Read every instance's master once: the fit check (R13) and the area census (R12) both
     // need it, and each master lookup crosses the FFI boundary.
-    let instances: Vec<Instance> = db
-        .inst_names()
-        .into_iter()
-        .map(|name| {
-            let m = db.inst_master(&name);
-            Instance {
-                name,
-                width: db.master_get_width(&m) as i32,
-                height: db.master_get_height(&m) as i32,
-                is_pad: db.master_is_pad(&m),
-                is_cover: db.master_is_cover(&m),
-                symmetry_r90: db.master_get_symmetry_r90(&m),
-            }
-        })
-        .collect();
+    let mut instances = read_instances(&db);
 
     // ⛔ **The `-utilization` form is TWO steps, not one**, and upstream runs them through
     // separate Tcl helpers: `make_die_helper` derives and SETS the die, then `make_rows_helper`
@@ -1350,6 +1430,12 @@ fn run_with(cli: Cli) -> ExitCode {
     }
     };
 
+    // ⛔ **Power intent is made physical INSIDE row building**, after the die, core and
+    // instance-fit checks and before the core is snapped to the site grid — and only when the
+    // core's lower left is non-negative. So a failure the row builder raises (site heights,
+    // hybrid parity, incompatible sites, no rows) comes AFTER the evaluator's own messages, and
+    // the census at the end counts the cells it inserted.
+    let evaluates = core_in.x_min >= 0 && core_in.y_min >= 0;
     let p = match plan(
         die_in,
         core_in,
@@ -1360,8 +1446,28 @@ fn run_with(cli: Cli) -> ExitCode {
         &instances,
     ) {
         Ok(p) => p,
-        Err(e) => return refuse(e, dbu_f),
+        Err(e) => {
+            let after_evaluation = matches!(
+                e,
+                PlanError::SiteHeightNotMultiple { .. }
+                    | PlanError::NoRows { .. }
+                    | PlanError::ParityWithHybridRows
+                    | PlanError::IncompatibleSite { .. }
+            );
+            if evaluates && after_evaluation {
+                if let Err(code) = eval_power_intent(&mut db, &cli.liberty) {
+                    return code;
+                }
+            }
+            return refuse(e, dbu_f);
+        }
     };
+    if evaluates {
+        if let Err(code) = eval_power_intent(&mut db, &cli.liberty) {
+            return code;
+        }
+        instances = read_instances(&db);
+    }
 
     // ⛔ **`updateVoltageDomain` runs AFTER the core area and the row counts are settled**, and
     // that ordering is load-bearing: upstream's `makeUniformRows` ends with

@@ -253,3 +253,141 @@ fn the_binary_answers_help_and_describe_without_a_database() {
     assert_eq!(code, 0);
     assert!(out.contains("--die-area"), "{out}");
 }
+
+// ---- power intent: made physical inside row building, by the power-intent engine ----
+
+/// The fixture with one power domain declared, so the floorplan has power intent to evaluate.
+fn fixture_with_power_domain(name: &str) -> PathBuf {
+    let p = fixture_copy(name);
+    let mut db = Db::open(&p).expect("opens");
+    assert!(db.pwr_domain_create("PD_TOP").expect("creates"), "a fresh domain");
+    db.write(&p).expect("writes");
+    p
+}
+
+/// A stand-in evaluator: records its arguments, says `lines`, writes `result` (or its own
+/// input, when `None`) as its `-o` output, and exits `code`. Its argv is
+/// `eval IN -o OUT [--liberty F]...`.
+fn fake_evaluator(name: &str, lines: &str, code: i32, result: Option<&std::path::Path>) -> PathBuf {
+    let p = scratch(name);
+    let args = scratch(&format!("{name}.args"));
+    let source = result.map(|r| format!("'{}'", r.display())).unwrap_or_else(|| "\"$2\"".into());
+    std::fs::write(
+        &p,
+        format!(
+            "#!/bin/sh\necho \"$@\" > '{}'\nprintf '%s' '{lines}'\ncp {source} \"$4\"\nexit {code}\n",
+            args.display()
+        ),
+    )
+    .expect("writes the stand-in");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    p
+}
+
+fn run_with_evaluator(evaluator: &std::path::Path, args: &[&str]) -> (i32, String) {
+    let out = Command::new(BIN)
+        .args(args)
+        .env("VYGES_UPF_BIN", evaluator)
+        .output()
+        .expect("the binary runs");
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).to_string())
+}
+
+fn floorplan_args<'a>(input: &'a std::path::Path, core: &'a str) -> Vec<&'a str> {
+    vec![
+        "run", input.to_str().unwrap(), "--die-area", "0 0 100 100", "--core-area", core,
+        "--site", SITE, "--liberty", "a.lib", "--liberty", "b.lib",
+    ]
+}
+
+/// Rule: the evaluation happens INSIDE row building, before the core-snap warning and the row
+/// count are reported, and the evaluator is handed the Liberty files in their read order.
+#[test]
+fn power_intent_is_evaluated_before_the_rows_are_reported() {
+    let input = fixture_with_power_domain("pi-order.odb");
+    let ev = fake_evaluator("ev-order", "[WARNING UPF-0024] stand-in line\n", 0, None);
+    let (code, err) = run_with_evaluator(&ev, &floorplan_args(&input, "10 10 90 90"));
+    assert_eq!(code, 0, "{err}");
+    let at = |s: &str| err.find(s).unwrap_or_else(|| panic!("no `{s}` in {err}"));
+    assert!(at("[WARNING UPF-0024] stand-in line") < at("IFP-0028"), "{err}");
+    assert!(at("IFP-0028") < at("IFP-0001"), "{err}");
+    let args = std::fs::read_to_string(scratch("ev-order.args")).expect("the evaluator ran");
+    assert!(args.starts_with("eval "), "{args}");
+    assert!(args.trim_end().ends_with("--liberty a.lib --liberty b.lib"), "{args}");
+}
+
+/// Rule: the floorplan goes on from the EVALUATED database, so the closing instance census
+/// counts the cells the evaluation inserted.
+#[test]
+fn the_census_counts_what_the_evaluation_inserted() {
+    let input = fixture_with_power_domain("pi-census.odb");
+    let before = Db::open(&input).expect("opens").num_insts();
+    let evaluated = fixture_with_power_domain("pi-census-evaluated.odb");
+    {
+        let mut db = Db::open(&evaluated).expect("opens");
+        let master = db.inst_master(&db.inst_names()[0]);
+        assert!(db.inst_try_create(&master, "inserted_by_evaluation").expect("creates"));
+        db.write(&evaluated).expect("writes");
+    }
+    let ev = fake_evaluator("ev-census", "", 0, Some(&evaluated));
+    let (code, err) = run_with_evaluator(&ev, &floorplan_args(&input, "10 10 90 90"));
+    assert_eq!(code, 0, "{err}");
+    let census = err.lines().find(|l| l.contains("IFP-0105")).unwrap_or_else(|| panic!("{err}"));
+    let count: usize = census
+        .split(|c: char| !c.is_ascii_digit())
+        .rfind(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok())
+        .unwrap_or_else(|| panic!("{census}"));
+    assert_eq!(count, before + 1, "{census}");
+}
+
+/// Rule: the evaluator's stops are the floorplan's: a reported error stops it (1), a step it
+/// does not implement is refused (3), and a failure without a message is an error (2).
+#[test]
+fn the_evaluators_stops_become_the_floorplans() {
+    for (name, lines, code, want) in [
+        ("ev-error", "[ERROR UPF-0029] No TOP DOMAIN found, aborting\n", 2, 1),
+        ("ev-refused", "", 3, 3),
+        ("ev-broken", "", 2, 2),
+    ] {
+        let input = fixture_with_power_domain(&format!("{name}.odb"));
+        let before = std::fs::read(&input).expect("reads");
+        let ev = fake_evaluator(name, lines, code, None);
+        let (got, err) = run_with_evaluator(&ev, &floorplan_args(&input, "10 10 90 90"));
+        assert_eq!(got, want, "{name}: {err}");
+        assert!(!err.contains("IFP-0001"), "{name}: no rows reported after a stop: {err}");
+        assert_eq!(std::fs::read(&input).expect("reads"), before, "{name}: nothing written");
+    }
+}
+
+/// Rule: a design with power intent is never floorplanned without its evaluation.
+#[test]
+fn power_intent_without_an_evaluator_is_an_error_not_a_quiet_floorplan() {
+    let input = fixture_with_power_domain("pi-missing.odb");
+    let (code, err) = run_with_evaluator(
+        std::path::Path::new("/nonexistent/vyges-upf"),
+        &floorplan_args(&input, "10 10 90 90"),
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("power intent"), "{err}");
+}
+
+/// Rule: nothing is evaluated when the core's lower left is negative (the row builder's guard),
+/// nor when the design declares no power intent at all.
+#[test]
+fn nothing_is_evaluated_without_intent_or_with_a_negative_core() {
+    let missing = std::path::Path::new("/nonexistent/vyges-upf");
+    let plain = fixture_copy("pi-none.odb");
+    let (code, err) = run_with_evaluator(missing, &floorplan_args(&plain, "10 10 90 90"));
+    assert_eq!(code, 0, "no intent, no evaluator needed: {err}");
+
+    // A negative core: the evaluator must not have been asked (asking a missing one is exit 2).
+    let input = fixture_with_power_domain("pi-negative.odb");
+    let (code, err) = run_with_evaluator(missing, &[
+        "run", input.to_str().unwrap(), "--die-area", "-50 -50 100 100", "--core-area",
+        "-10 -10 90 90", "--site", SITE,
+    ]);
+    assert_ne!(code, 2, "{err}");
+    assert!(!err.contains("power intent"), "{err}");
+}
