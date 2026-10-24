@@ -24,7 +24,7 @@ fn diag_line(msg: String) {
     let text = head.strip_prefix("vyges-ifp make-tracks: ").or_else(|| head.strip_prefix("vyges-ifp: ")).unwrap_or(&head).to_string();
     let code = text.split_whitespace().next().filter(|c| c.len() == 8 && c.starts_with("IFP-") && c[4..].bytes().all(|b| b.is_ascii_digit())).map(str::to_string);
     let ev = vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Error, text);
-    vyges_events::emit(&match code {
+    emit_line(&match code {
         Some(c) => ev.with_code(c),
         None => ev.with_code("IFP-ERROR"),
     });
@@ -414,6 +414,41 @@ fn parse_args_inner(args: &[String], make_rows: bool) -> Result<Cli, String> {
     Ok(cli)
 }
 
+/// Emit one message. A message that opens with a reference code (`IFP-0001 Added …`) is written as
+/// the reference writes it, `[INFO IFP-0001] Added …`, through the suite logger, which also emits
+/// its event under that code; anything else is a plain event.
+fn emit_line(ev: &vyges_events::Event) {
+    use std::sync::{Mutex, OnceLock};
+    static LOG: OnceLock<Mutex<vyges_events::logger::Logger>> = OnceLock::new();
+    let Some((tool, id, text)) = reference_code(&ev.raw_msg) else {
+        vyges_events::emit(ev);
+        return;
+    };
+    let mut log = LOG
+        .get_or_init(|| Mutex::new(vyges_events::logger::Logger::new().events("vyges-ifp")))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match ev.severity {
+        vyges_events::Severity::Info => log.info(tool, id, text),
+        vyges_events::Severity::Warn => log.warn(tool, id, text),
+        _ => {
+            // The exit status carries the stop; this only writes the line.
+            let _ = log.error::<()>(tool, id, text);
+        }
+    }
+    for l in log.take_lines() {
+        eprintln!("{l}");
+    }
+}
+
+/// `TOOL-NNNN rest` → the tool, the id and the rest; `None` when the message opens otherwise.
+fn reference_code(msg: &str) -> Option<(&str, u16, &str)> {
+    let (code, text) = msg.split_once(' ')?;
+    let (tool, id) = vyges_events::logger::parse_code(code)?;
+    Some((tool, id, text))
+}
+
+
 /// Report the plan the way the goldens do (R11), then a census line.
 ///
 /// The upstream message ids are quoted in the text because that is what makes a log diff
@@ -424,7 +459,7 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
     let um = |v: i32| (v as f64) / dbu;
 
     if p.core_was_snapped() {
-        vyges_events::emit(
+        emit_line(
             &Event::new(
                 "vyges-ifp",
                 Severity::Warn,
@@ -444,7 +479,7 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
     // one reports a single line per site. The two constructions are genuinely different, so they
     // do not share a message.
     if let Some((base, n)) = &p.pattern_rows {
-        vyges_events::emit(
+        emit_line(
             &Event::new(
                 "vyges-ifp",
                 Severity::Info,
@@ -458,7 +493,7 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
     for (site, count) in &p.rows_per_site {
         if *count == 0 {
             // A site that tiled nothing is said out loud; silence would read as "it worked".
-            vyges_events::emit(
+            emit_line(
                 &Event::new(
                     "vyges-ifp",
                     Severity::Warn,
@@ -468,7 +503,7 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
                 .with_objects(vec![format!("site:{site}")]),
             );
         } else {
-            vyges_events::emit(
+            emit_line(
                 &Event::new(
                     "vyges-ifp",
                     Severity::Info,
@@ -539,10 +574,10 @@ fn emit_events(p: &Plan, dbu: f64, applied: bool, num_insts: usize, instances: &
         format!("IFP-0105 {:27} {num_insts:15}", "Number of instances:"),
     ));
     for (code, text) in census {
-        vyges_events::emit(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
+        emit_line(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
     }
 
-    vyges_events::emit(
+    emit_line(
         &Event::new(
             "vyges-ifp",
             Severity::Info,
@@ -734,7 +769,7 @@ fn refuse(e: PlanError, dbu: f64) -> ExitCode {
     if let PlanError::NoRows { core_requested, core_snapped, ref empty_sites } = e {
         if core_snapped.x_min != core_requested.x_min || core_snapped.y_min != core_requested.y_min
         {
-            vyges_events::emit(
+            emit_line(
                 &Event::new(
                     "vyges-ifp",
                     Severity::Warn,
@@ -748,7 +783,7 @@ fn refuse(e: PlanError, dbu: f64) -> ExitCode {
             );
         }
         for site in empty_sites {
-            vyges_events::emit(
+            emit_line(
                 &Event::new(
                     "vyges-ifp",
                     Severity::Warn,
@@ -786,7 +821,7 @@ fn refuse(e: PlanError, dbu: f64) -> ExitCode {
         ),
         ref other => other.to_string(),
     };
-    vyges_events::emit(&Event::new("vyges-ifp", Severity::Error, text).with_code(code));
+    emit_line(&Event::new("vyges-ifp", Severity::Error, text).with_code(code));
     diag!("vyges-ifp: {e}");
     ExitCode::from(1)
 }
@@ -828,7 +863,7 @@ fn report_polygon_areas(db: &Db, dbu: f64, instances: &[Instance]) {
     census.push(("IFP-CENSUS-INSTS",
         format!("IFP-0105 {:27} {:15}", "Number of instances:", db.num_insts())));
     for (code, text) in census {
-        vyges_events::emit(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
+        emit_line(&Event::new("vyges-ifp", Severity::Info, text).with_code(code));
     }
 }
 
@@ -879,7 +914,7 @@ fn run_polygon(
             .collect()
     };
     let fail = |code: &str, text: String| -> ExitCode {
-        vyges_events::emit(&Event::new("vyges-ifp", Severity::Error, text).with_code(code));
+        emit_line(&Event::new("vyges-ifp", Severity::Error, text).with_code(code));
         ExitCode::from(1)
     };
 
@@ -901,12 +936,12 @@ fn run_polygon(
     }
 
     let die_poly = to_poly(&cli.die_pts);
-    vyges_events::emit(&Event::new(
+    emit_line(&Event::new(
         "vyges-ifp",
         Severity::Info,
         format!("IFP-0005 Added {} die polygon vertices to the list.", die_poly.len()),
     ).with_code("IFP-DIE-POLYGON-VERTICES"));
-    vyges_events::emit(&Event::new(
+    emit_line(&Event::new(
         "vyges-ifp",
         Severity::Info,
         "IFP-0106 Initializing floorplan in polygon mode.".to_string(),
@@ -960,7 +995,7 @@ fn run_polygon(
         let clx = vyges_ifp::div_ceil(core_bbox.x_min, base.width) * base.width;
         let cly = vyges_ifp::div_ceil(core_bbox.y_min, base.height) * base.height;
         if clx != core_bbox.x_min || cly != core_bbox.y_min {
-            vyges_events::emit(&Event::new(
+            emit_line(&Event::new(
                 "vyges-ifp",
                 Severity::Warn,
                 format!(
@@ -1008,7 +1043,7 @@ fn run_polygon(
         }
     }
     for (site, n) in &per_site {
-        vyges_events::emit(&Event::new(
+        emit_line(&Event::new(
             "vyges-ifp",
             Severity::Info,
             format!("IFP-1002 Added {n} polygon-aware rows for site {site}."),
@@ -1024,7 +1059,7 @@ fn run_polygon(
         return ExitCode::from(2);
     }
 
-    vyges_events::emit(&Event::new(
+    emit_line(&Event::new(
         "vyges-ifp",
         Severity::Info,
         // ⚠️ odb closes the ring, so its point count is one more than the vertices given.
@@ -1183,7 +1218,7 @@ fn run_with(cli: Cli) -> ExitCode {
         Some(um) => {
             let g = vyges_ifp::microns_to_mfg_grid(um, dbu, grid.unwrap_or(0));
             if g <= 0 {
-                vyges_events::emit(
+                emit_line(
                     &vyges_events::Event::new(
                         "vyges-ifp",
                         vyges_events::Severity::Error,
@@ -1246,7 +1281,7 @@ fn run_with(cli: Cli) -> ExitCode {
         );
         if die.is_empty() {
             let code = if cli.core_space.is_some() { "0064" } else { "0063" };
-            vyges_events::emit(&vyges_events::Event::new(
+            emit_line(&vyges_events::Event::new(
                 "vyges-ifp",
                 vyges_events::Severity::Error,
                 format!("IFP-{code} Floorplan die area is 0. Cannot build rows."),
@@ -1271,7 +1306,7 @@ fn run_with(cli: Cli) -> ExitCode {
             // Upstream's validators, in its own order: IFP-12 then IFP-36, then the spacings —
             // each the validator's own message (`{name} {value} not >= {limit}`, `>` for positive).
             let validator_error = |code: &str, msg: String| {
-                vyges_events::emit(&vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Error, format!("{code} {msg}")).with_code(code));
+                emit_line(&vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Error, format!("{code} {msg}")).with_code(code));
                 ExitCode::from(1)
             };
             if util < 0.0 {
@@ -1292,7 +1327,7 @@ fn run_with(cli: Cli) -> ExitCode {
             }
             let (b, t, l, r) = (to_dbu(sp[0], dbu_f), to_dbu(sp[1], dbu_f),
                                 to_dbu(sp[2], dbu_f), to_dbu(sp[3], dbu_f));
-            vyges_events::emit(
+            emit_line(
                 &vyges_events::Event::new(
                     "vyges-ifp",
                     vyges_events::Severity::Info,
@@ -1549,7 +1584,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
 
             if xp == 0 || yp == 0 {
                 // Upstream IFP-56: warn, and generate NO tracks for this layer.
-                vyges_events::emit(
+                emit_line(
                     &vyges_events::Event::new(
                         "vyges-ifp",
                         vyges_events::Severity::Warn,
@@ -1610,7 +1645,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
                         "y_offset > die height (IFP-22)",
                     ),
                 };
-                vyges_events::emit(
+                emit_line(
                     &vyges_events::Event::new("vyges-ifp", vyges_events::Severity::Warn, msg)
                         .with_code(code)
                         .with_objects(vec![format!("layer:{layer}")]),
@@ -1843,5 +1878,20 @@ mod pin_tests {
                 "{tok} looks like a hardcoded commit -- use the {PIN_TOKEN} placeholder"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod emit_line_tests {
+    use super::reference_code;
+
+    /// Rule: only a message that OPENS with a reference code takes the reference's line format, and
+    /// the code is not repeated in the text; our own messages stay events.
+    #[test]
+    fn a_reference_code_opens_the_message() {
+        assert_eq!(reference_code("IFP-0001 Added 10 rows of 50 site core."), Some(("IFP", 1, "Added 10 rows of 50 site core.")));
+        assert_eq!(reference_code("IFP-0102 Core area:                  1.000 um^2"), Some(("IFP", 102, "Core area:                  1.000 um^2")));
+        assert_eq!(reference_code("floorplan applied: 10 rows"), None);
+        assert_eq!(reference_code("IFP-ROWS Added"), None);
     }
 }
