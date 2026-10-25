@@ -21,6 +21,10 @@
 //! right does not move, or the core area being replaced by what the rows cover — it is a
 //! deliberate match to observable behaviour asserted by upstream's own regression goldens.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_ifp::…` paths resolve here.
+extern crate self as vyges_ifp;
+
 /// An axis-aligned rectangle in database units.
 /// This crate's version, as Cargo knows it — the single number the whole suite is released on.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -2248,3 +2252,10 @@ mod make_tracks_tests {
         assert_eq!(microns_to_mfg_grid(0.0106, 1000, 0), 11, "no grid: plain rounding");
     }
 }
+
+/// The `vyges-ifp` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
