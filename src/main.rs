@@ -146,6 +146,14 @@ const DESCRIBE: &str = r#"{
   "invocation": {
     "args_template": ["run", "{odb}"],
     "optional": [
+      { "arg": "die_area", "flag": "--die-area" },
+      { "arg": "core_area", "flag": "--core-area" },
+      { "arg": "utilization", "flag": "--utilization" },
+      { "arg": "aspect_ratio", "flag": "--aspect-ratio" },
+      { "arg": "core_space", "flag": "--core-space" },
+      { "arg": "site", "flag": "--site" },
+      { "arg": "additional_sites", "flag": "--additional-sites" },
+      { "arg": "liberty", "flag": "--liberty" },
       { "arg": "out", "flag": "-o" },
       { "arg": "out_odb", "flag": "--out-odb" }
     ],
@@ -153,12 +161,17 @@ const DESCRIBE: &str = r#"{
   },
   "inputs": {
     "type": "object",
-    "required": ["odb", "die_area", "core_area", "site"],
+    "required": ["odb", "site"],
     "properties": {
       "odb": { "type": "string", "description": "path to the design database (.odb)" },
-      "die_area": { "type": "string", "description": "die rectangle in microns, 'x1 y1 x2 y2'" },
+      "die_area": { "type": "string", "description": "die rectangle in microns, 'x1 y1 x2 y2'; give it with core_area, or give utilization with core_space instead" },
       "core_area": { "type": "string", "description": "core rectangle in microns, 'x1 y1 x2 y2'" },
-      "site": { "type": "string", "description": "base site name" },
+      "utilization": { "type": "number", "description": "derive the die from the placed cell area at this utilization, in PERCENT; needs core_space, refused with die_area" },
+      "aspect_ratio": { "type": "number", "description": "height/width of the derived core (default 1.0)" },
+      "core_space": { "type": "string", "description": "margins in microns, 'b t l r' or one value for all four" },
+      "site": { "type": "string", "description": "base site name, whose height sets the row pitch" },
+      "additional_sites": { "type": "string", "description": "also tile rows for these sites, comma-separated (hybrid rows)" },
+      "liberty": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Liberty files the design was read with, in read order; needed only for a design with power intent" },
       "out_odb": { "type": "string", "description": "write the database here instead of in place" },
       "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
     }
@@ -170,7 +183,31 @@ const DESCRIBE: &str = r#"{
     "id": "floorplan-built",
     "field": "status",
     "pass_when": { "eq": "applied" }
-  }
+  },
+  "tools": [
+    {
+      "name": "ifp.make_tracks",
+      "summary": "routing tracks over the die, from the technology's own pitches (or given per layer)",
+      "invocation": {
+        "args_template": ["make-tracks", "{odb}"],
+        "optional": [
+          { "arg": "track", "flag": "--track" },
+          { "arg": "out_odb", "flag": "--out-odb" }
+        ],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["odb"],
+        "properties": {
+          "odb": { "type": "string", "description": "path to a floorplanned design database (.odb)" },
+          "track": { "type": ["string", "array"], "items": { "type": "string" }, "description": "one layer explicitly, 'LAYER:xoff,xpitch,yoff,ypitch' in microns; omit for every routing layer from the LEF" },
+          "out_odb": { "type": "string", "description": "write the database here instead of in place" }
+        }
+      },
+      "assertion": { "id": "tracks-built", "field": "status", "pass_when": { "eq": "applied" } }
+    }
+  ]
 }
 "#;
 
@@ -1589,6 +1626,9 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 }
                 explicit.push((layer.to_string(), v));
             }
+            // The report is always JSON; the flag is accepted because a caller that drives every
+            // engine the same way (`vyges mcp`) appends it.
+            "--json" => {}
             a if a.starts_with("--") => {
                 diag!("vyges-ifp make-tracks: unknown option {a}");
                 return ExitCode::from(2);
@@ -1927,6 +1967,40 @@ mod tests {
         assert!(limits
             .iter()
             .any(|l| l.as_str().unwrap_or("").contains("IN PLACE")));
+    }
+
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
     }
 
     #[test]
