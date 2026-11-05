@@ -62,7 +62,8 @@ is not the rectangle the first step laid out. `--utilization` excludes `--die-ar
 ## Correctness — measured, not claimed
 
 The algorithm is written from the published behaviour of `initialize_floorplan` and checked against
-the reference `ifp` regression goldens at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`. It is a
+the reference `ifp` regression goldens at pin `27288f5c90265ae5296b2f5a9fa6e8714fa191ad`; at pin
+`4155ac31` (2026-11-03) the 39 reference cases produce goldens byte-identical to those, so that result holds. It is a
 reimplementation, not a transliteration: where the two disagree, the goldens are the arbiter.
 
 The rules are stated separately from the code, and the arithmetic is split from
