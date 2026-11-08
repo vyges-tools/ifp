@@ -52,7 +52,8 @@ USAGE:
   vyges physical ifp run <design.odb> --die-area 'x1 y1 x2 y2' --core-area 'x1 y1 x2 y2' --site NAME
   vyges physical ifp run <design.odb> --utilization PCT --core-space 'b t l r' --site NAME
   vyges physical ifp make-rows <design.odb> --core-area 'x1 y1 x2 y2' --site NAME
-  vyges physical ifp make-tracks <design.odb> [--track LAYER:xoff,xpitch,yoff,ypitch]... [--out-odb FILE]
+  vyges physical ifp make-tracks <design.odb> [--track LAYER:xoff,xpitch,yoff,ypitch]...
+                                 [--track-mask LAYER:FIRST[:SAMEMASK]]... [--out-odb FILE]
   vyges physical ifp --describe
   vyges physical ifp --help
 
@@ -64,6 +65,10 @@ MAKE-TRACKS:
   Routing tracks over the die, from the technology's own pitches. With no --track, every ROUTING
   layer with a non-zero routing level is taken from the LEF; --track gives one layer explicitly,
   in MICRONS, which is the form a technology's .tracks file uses. Repeatable.
+  --track-mask gives a multi-mask layer's tracks their masks (DEF TRACKS ... MASK FIRST
+  [SAMEMASK]): the first track gets mask FIRST and the masks alternate track by track, which is
+  the colour grid the layer's wires are coloured by. Repeatable; an extension, the reference
+  make_tracks writes no track masks.
 
 OPTIONS:
   --die-area 'x1 y1 x2 y2'   die rectangle, in MICRONS
@@ -192,6 +197,7 @@ const DESCRIBE: &str = r#"{
         "args_template": ["make-tracks", "{odb}"],
         "optional": [
           { "arg": "track", "flag": "--track" },
+          { "arg": "track_mask", "flag": "--track-mask" },
           { "arg": "out_odb", "flag": "--out-odb" }
         ],
         "emits_json": true
@@ -202,6 +208,7 @@ const DESCRIBE: &str = r#"{
         "properties": {
           "odb": { "type": "string", "description": "path to a floorplanned design database (.odb)" },
           "track": { "type": ["string", "array"], "items": { "type": "string" }, "description": "one layer explicitly, 'LAYER:xoff,xpitch,yoff,ypitch' in microns; omit for every routing layer from the LEF" },
+          "track_mask": { "type": ["string", "array"], "items": { "type": "string" }, "description": "a multi-mask layer's track masks, 'LAYER:FIRST[:SAMEMASK]' (DEF TRACKS ... MASK); the masks alternate from FIRST track by track" },
           "out_odb": { "type": "string", "description": "write the database here instead of in place" }
         }
       },
@@ -1585,6 +1592,7 @@ fn make_tracks(args: &[String]) -> ExitCode {
     let mut out: Option<&str> = None;
     // LAYER -> (x_offset, x_pitch, y_offset, y_pitch) in microns
     let mut explicit: Vec<(String, [f64; 4])> = Vec::new();
+    let mut track_masks: Vec<vyges_ifp::TrackMask> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -1626,6 +1634,20 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 }
                 explicit.push((layer.to_string(), v));
             }
+            "--track-mask" => {
+                i += 1;
+                let Some(spec) = args.get(i) else {
+                    diag!("vyges-ifp make-tracks: --track-mask needs LAYER:FIRST[:SAMEMASK]");
+                    return ExitCode::from(2);
+                };
+                match vyges_ifp::parse_track_mask(spec) {
+                    Ok(m) => track_masks.push(m),
+                    Err(e) => {
+                        diag!("vyges-ifp make-tracks: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             // The report is always JSON; the flag is accepted because a caller that drives every
             // engine the same way (`vyges mcp`) appends it.
             "--json" => {}
@@ -1650,6 +1672,14 @@ fn make_tracks(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    for m in &track_masks {
+        let ty = db.layer_get_type(&m.layer).unwrap_or_default();
+        if let Some(why) = vyges_ifp::track_mask_refusal(m, &ty, db.layer_get_num_masks(&m.layer)) {
+            diag!("vyges-ifp make-tracks: {why}");
+            return ExitCode::from(2);
+        }
+    }
 
     let dbu = db.dbu_per_micron();
     // ⚠️ `manufacturing_grid` is Result<Option<_>>: absent means the tech declares none, which is
@@ -1757,6 +1787,10 @@ fn make_tracks(args: &[String]) -> ExitCode {
         diag!("vyges-ifp make-tracks: no routing layer produced a track pattern.");
         return ExitCode::from(3);
     }
+    if let Some(m) = track_masks.iter().find(|m| !work.iter().any(|w| w.0 == m.layer)) {
+        diag!("vyges-ifp make-tracks: --track-mask names {}, which gets no tracks here", m.layer);
+        return ExitCode::from(2);
+    }
 
     let mut made: Vec<serde_json::Value> = Vec::new();
     for (layer, xoff, xpitch, yoff, ypitch) in &work {
@@ -1800,22 +1834,29 @@ fn make_tracks(args: &[String]) -> ExitCode {
                 continue;
             }
         };
-        // ⛔ X then Y, on one grid -- `makeTracks`'s order.
-        if let Err(e) = db.add_track_pattern_x(layer, px.origin, px.count, px.step) {
+        // ⛔ X then Y, on one grid -- `makeTracks`'s order. A --track-mask layer gets its DEF
+        // track mask on both axes; without one the patterns are written exactly as upstream's.
+        let mask = track_masks.iter().find(|m| &m.layer == layer);
+        let (first, same) = mask.map_or((0, false), |m| (m.first_mask as i32, m.same_mask));
+        if let Err(e) = db.add_track_pattern_x_masked(layer, px.origin, px.count, px.step, first, same) {
             diag!("vyges-ifp make-tracks: {layer}: {e}");
             return ExitCode::from(1);
         }
-        if let Err(e) = db.add_track_pattern_y(layer, py.origin, py.count, py.step) {
+        if let Err(e) = db.add_track_pattern_y_masked(layer, py.origin, py.count, py.step, first, same) {
             diag!("vyges-ifp make-tracks: {layer}: {e}");
             return ExitCode::from(1);
         }
         // A layer is now all-or-nothing, so neither axis can be null here — a skipped layer
         // appears in `skipped` alone, exactly as upstream leaves it with no grid.
-        made.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "layer": layer,
             "x": {"origin": px.origin, "count": px.count, "step": px.step},
             "y": {"origin": py.origin, "count": py.count, "step": py.step},
-        }));
+        });
+        if let Some(m) = mask {
+            entry["mask"] = serde_json::json!({"first": m.first_mask, "samemask": m.same_mask});
+        }
+        made.push(entry);
     }
 
     let dest = out.unwrap_or(path);

@@ -391,3 +391,57 @@ fn nothing_is_evaluated_without_intent_or_with_a_negative_core() {
     assert_ne!(code, 2, "{err}");
     assert!(!err.contains("power intent"), "{err}");
 }
+
+// ---- track masks (multi-patterned layers) ----
+
+/// A die with no tracks over the synthetic two-mask stack the opendb crate ships for its own
+/// mask tests (M1, M2 at `MASK 2`; M3 single-mask).
+fn masked_stack(name: &str) -> PathBuf {
+    let dir = "../vyges-tools-opendb/tests/fixtures/masks";
+    let def = scratch(&format!("{name}.def"));
+    std::fs::write(
+        &def,
+        "VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\nDESIGN masks ;\n\
+         UNITS DISTANCE MICRONS 1000 ;\nDIEAREA ( 0 0 ) ( 2000 2000 ) ;\nEND DESIGN\n",
+    )
+    .expect("scratch DEF");
+    let mut db = Db::new();
+    db.read_lef(format!("{dir}/masks.lef")).expect("the sibling fixture LEF reads");
+    db.read_def(&def, "default").expect("the DEF reads");
+    let p = scratch(name);
+    db.write(&p).expect("writes");
+    p
+}
+
+/// `--track-mask LAYER:FIRST[:SAMEMASK]` lands as the DEF track mask on both axes of that layer
+/// and nowhere else; a layer without one is written exactly as before (no mask).
+#[test]
+fn track_masks_land_on_the_named_layers_only() {
+    let p = masked_stack("tm.odb");
+    let (code, out) = run(&[
+        "make-tracks", p.to_str().unwrap(), "--track-mask", "M1:2", "--track-mask", "M2:1:SAMEMASK",
+    ]);
+    assert_eq!(code, 0, "{out}");
+    let db = Db::open(&p).expect("opens");
+    let (x1, y1) = db.track_pattern_masks("M1").expect("M1");
+    assert!(!y1.is_empty() && x1.len() == y1.len());
+    assert!(x1.iter().chain(&y1).all(|m| m.first_mask == 2 && !m.same_mask), "{x1:?} {y1:?}");
+    let (x2, y2) = db.track_pattern_masks("M2").expect("M2");
+    assert!(x2.iter().chain(&y2).all(|m| m.first_mask == 1 && m.same_mask), "{x2:?} {y2:?}");
+    let (x3, y3) = db.track_pattern_masks("M3").expect("M3");
+    assert!(!x3.is_empty() && x3.iter().chain(&y3).all(|m| m.first_mask == 0 && !m.same_mask));
+    assert!(out.contains("\"mask\""), "the report says which layers got masks: {out}");
+}
+
+/// A track mask on a single-mask layer, or past the layer's mask count, is a usage error that
+/// writes nothing.
+#[test]
+fn a_track_mask_on_a_single_mask_layer_is_refused() {
+    let p = masked_stack("tm-bad.odb");
+    let before = std::fs::read(&p).expect("reads");
+    for spec in ["M3:1", "M1:3", "V1:1"] {
+        let out = Command::new(BIN).args(["make-tracks", p.to_str().unwrap(), "--track-mask", spec]).output().expect("runs");
+        assert_eq!(out.status.code(), Some(2), "{spec}");
+    }
+    assert_eq!(std::fs::read(&p).expect("reads"), before, "nothing written");
+}

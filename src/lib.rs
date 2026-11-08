@@ -2126,6 +2126,81 @@ pub fn microns_to_mfg_grid(microns: f64, dbu_per_micron: i32, manufacturing_grid
     }
 }
 
+/// A `--track-mask` request: the DEF `TRACKS ... MASK <first> [SAMEMASK]` for one layer's tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackMask {
+    pub layer: String,
+    /// The mask of the first track, 1..=3; the masks then cycle track by track.
+    pub first_mask: u8,
+    /// Every track on `first_mask` (DEF `SAMEMASK`).
+    pub same_mask: bool,
+}
+
+/// Parse `LAYER:FIRST[:SAMEMASK]` (FIRST 1..=3). Not a reference ifp option — the reference's
+/// `make_tracks` writes no track masks; this one exists so a multi-patterned layer's tracks carry
+/// the colour grid its wires are coloured by (DEF `TRACKS ... MASK`).
+pub fn parse_track_mask(spec: &str) -> Result<TrackMask, String> {
+    let f: Vec<&str> = spec.split(':').collect();
+    let usage = || format!("--track-mask wants LAYER:FIRST[:SAMEMASK], got {spec:?}");
+    if f.len() < 2 || f.len() > 3 || f[0].is_empty() {
+        return Err(usage());
+    }
+    let first_mask = match f[1].trim().parse::<u8>() {
+        Ok(m @ 1..=3) => m,
+        _ => return Err(format!("--track-mask {spec:?}: the first mask must be 1, 2 or 3")),
+    };
+    let same_mask = match f.get(2).map(|t| t.trim().to_ascii_uppercase()) {
+        None => false,
+        Some(t) if t == "SAMEMASK" => true,
+        Some(_) => return Err(usage()),
+    };
+    Ok(TrackMask { layer: f[0].to_string(), first_mask, same_mask })
+}
+
+/// Why a `--track-mask` cannot apply to a layer: it must be a routing layer with more masks than
+/// one, and the first mask must be one of them. `None` when it applies.
+pub fn track_mask_refusal(m: &TrackMask, layer_type: &str, num_masks: u32) -> Option<String> {
+    if layer_type != "ROUTING" {
+        return Some(format!("--track-mask: {} is not a routing layer ({layer_type})", m.layer));
+    }
+    if num_masks < 2 {
+        return Some(format!("--track-mask: {} is a single-mask layer (no MASK in the LEF)", m.layer));
+    }
+    if m.first_mask as u32 > num_masks {
+        return Some(format!(
+            "--track-mask: {} has {num_masks} masks, so the first mask cannot be {}",
+            m.layer, m.first_mask
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod track_mask_tests {
+    use super::*;
+
+    #[test]
+    fn a_track_mask_is_layer_first_mask_and_an_optional_samemask() {
+        let m = parse_track_mask("M2:1").unwrap();
+        assert_eq!(m, TrackMask { layer: "M2".into(), first_mask: 1, same_mask: false });
+        assert!(parse_track_mask("M2:2:samemask").unwrap().same_mask);
+        for bad in ["M2", "M2:0", "M2:4", "M2:x", ":1", "M2:1:other", "M2:1:SAMEMASK:1"] {
+            assert!(parse_track_mask(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_track_mask_applies_only_to_a_multi_mask_routing_layer() {
+        let m = parse_track_mask("M1:2").unwrap();
+        assert!(track_mask_refusal(&m, "ROUTING", 2).is_none());
+        assert!(track_mask_refusal(&m, "CUT", 2).unwrap().contains("not a routing layer"));
+        assert!(track_mask_refusal(&m, "ROUTING", 1).unwrap().contains("single-mask"));
+        let m3 = parse_track_mask("M1:3").unwrap();
+        assert!(track_mask_refusal(&m3, "ROUTING", 2).unwrap().contains("2 masks"));
+        assert!(track_mask_refusal(&m3, "ROUTING", 3).is_none());
+    }
+}
+
 #[cfg(test)]
 mod make_tracks_tests {
     use super::*;
