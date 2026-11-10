@@ -1,7 +1,5 @@
 # vyges-ifp
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Floorplan initialization over the OpenDB design database: set the die area, snap the core to the
 site grid, build the rows, and store the core area those rows actually cover.
 
